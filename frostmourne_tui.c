@@ -210,7 +210,7 @@ void render_ui() {
 
     // Header
     char header[256];
-    snprintf(header, 256, " BLADE v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
+    snprintf(header, 256, " frostmourne v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
              TARGET_RAW, result_count);
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
