@@ -7,14 +7,14 @@
 #include <immintrin.h> // AVX2
 
 // ==========================================
-// CONFIGURATION & COLOR MACROS
+// CONFIGURATION
 // ==========================================
 #define MAX_PATH_LEN 4096
 #define THREAD_COUNT 16
 #define QUEUE_SIZE 16384
 #define INITIAL_RESULT_CAPACITY 4096
 
-// The raw Windows API requires us to mix paints ourselves
+// Color Macros
 #define FOREGROUND_WHITE (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
 #define FOREGROUND_BLACK 0
 
@@ -189,26 +189,32 @@ unsigned __stdcall worker_thread(void *arg) {
 }
 
 // ==========================================
-// UI RENDERING ENGINE
+// UI RENDERING
 // ==========================================
 void render_ui() {
-    CHAR_INFO *buffer = (CHAR_INFO*)malloc(console_width * console_height * sizeof(CHAR_INFO));
-    if (!buffer) return;
+    static CHAR_INFO *buffer = NULL;
+    static int buf_size = 0;
+    
+    int needed_size = console_width * console_height;
+    if (!buffer || buf_size != needed_size) {
+        if (buffer) free(buffer);
+        buffer = (CHAR_INFO*)malloc(needed_size * sizeof(CHAR_INFO));
+        buf_size = needed_size;
+    }
 
-    // Clear Buffer (Blue background for "Retro" feel, or Black for clean)
-    for (int i = 0; i < console_width * console_height; i++) {
+    // Clear Background
+    for (int i = 0; i < needed_size; i++) {
         buffer[i].Char.AsciiChar = ' ';
-        buffer[i].Attributes = FOREGROUND_WHITE; 
+        buffer[i].Attributes = FOREGROUND_WHITE;
     }
 
     // Header
     char header[256];
-    snprintf(header, 256, " BLADE v2 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
+    snprintf(header, 256, " BLADE v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
              TARGET_RAW, result_count);
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
         buffer[i].Char.AsciiChar = header[i];
-        // White text on Dark Red background for header
         buffer[i].Attributes = BACKGROUND_RED | FOREGROUND_INTENSITY | FOREGROUND_WHITE;
     }
 
@@ -216,7 +222,6 @@ void render_ui() {
     EnterCriticalSection(&result_lock);
     long count = result_count;
     
-    // Adjust scrolling
     if (selected_index < scroll_offset) scroll_offset = selected_index;
     if (selected_index >= scroll_offset + (console_height - 2)) scroll_offset = selected_index - (console_height - 3);
     if (scroll_offset < 0) scroll_offset = 0;
@@ -224,11 +229,7 @@ void render_ui() {
     int y = 1;
     for (int i = scroll_offset; i < count && y < console_height; i++) {
         int is_selected = (i == selected_index);
-        
-        // Default: Green text on Black
         WORD attr = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
-        
-        // Selected: Black text on Green background
         if (is_selected) attr = BACKGROUND_GREEN | FOREGROUND_BLACK;
 
         char *text = results[i].path;
@@ -241,19 +242,28 @@ void render_ui() {
     }
     LeaveCriticalSection(&result_lock);
 
-    // Swap Buffers
     COORD bufferSize = { (SHORT)console_width, (SHORT)console_height };
     COORD bufferCoord = { 0, 0 };
     SMALL_RECT writeRegion = { 0, 0, (SHORT)(console_width - 1), (SHORT)(console_height - 1) };
     WriteConsoleOutputA(hConsoleOut, buffer, bufferSize, bufferCoord, &writeRegion);
-    free(buffer);
 }
 
 void open_selection() {
     if (result_count == 0) return;
-    char param[MAX_PATH_LEN + 10];
-    // Quotes essential for paths with spaces
-    snprintf(param, sizeof(param), "/select,\"%s\"", results[selected_index].path);
+    
+    char absolute_path[MAX_PATH_LEN];
+    char *file_part;
+    
+    // FORCE ABSOLUTE PATH
+    GetFullPathNameA(results[selected_index].path, MAX_PATH_LEN, absolute_path, &file_part);
+
+    // NORMALIZE SLASHES
+    for (int i = 0; absolute_path[i]; i++) {
+        if (absolute_path[i] == '/') absolute_path[i] = '\\';
+    }
+
+    char param[MAX_PATH_LEN + 32];
+    snprintf(param, sizeof(param), "/select,\"%s\"", absolute_path);
     
     ShellExecuteA(NULL, "open", "explorer.exe", param, NULL, SW_SHOWDEFAULT);
 }
@@ -267,7 +277,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Init Global State
     strcpy(TARGET_RAW, argv[2]);
     TARGET_LEN = strlen(TARGET_RAW);
     if (strchr(TARGET_RAW, '*') || strchr(TARGET_RAW, '?')) IS_WILDCARD = 1;
@@ -279,7 +288,6 @@ int main(int argc, char **argv) {
     InitializeCriticalSection(&queue_lock);
     InitializeCriticalSection(&result_lock);
 
-    // Setup Console
     hConsoleOut = GetStdHandle(STD_OUTPUT_HANDLE);
     hConsoleIn = GetStdHandle(STD_INPUT_HANDLE);
     
@@ -293,14 +301,12 @@ int main(int argc, char **argv) {
     console_width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     console_height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
 
-    // Start Search
     push_job(argv[1]);
     HANDLE threads[THREAD_COUNT];
     for (int i = 0; i < THREAD_COUNT; i++) {
         threads[i] = (HANDLE)_beginthreadex(NULL, 0, worker_thread, NULL, 0, NULL);
     }
 
-    // Input Loop
     INPUT_RECORD ir[128];
     DWORD recordsRead;
     int running = 1;
