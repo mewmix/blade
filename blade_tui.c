@@ -210,7 +210,7 @@ void render_ui() {
 
     // Header
     char header[256];
-    snprintf(header, 256, " frostmourne v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
+    snprintf(header, 256, " blade v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
              TARGET_RAW, result_count);
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
@@ -344,6 +344,28 @@ int main(int argc, char **argv) {
         render_ui();
         Sleep(16); 
     }
+
+    // ==========================================
+    // CLEANUP & EXIT
+    // ==========================================
+    
+    // 1. Restore Cursor Visibility
+    cursorInfo.bVisible = TRUE;
+    SetConsoleCursorInfo(hConsoleOut, &cursorInfo);
+
+    // 2. Reset Attributes (Standard Grey on Black)
+    SetConsoleTextAttribute(hConsoleOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+
+    // 3. Clear the Screen
+    DWORD written;
+    COORD coord = {0, 0};
+    DWORD size = console_width * console_height;
+    // Fill with spaces
+    FillConsoleOutputCharacterA(hConsoleOut, ' ', size, coord, &written);
+    // Fill with standard attributes
+    FillConsoleOutputAttribute(hConsoleOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE, size, coord, &written);
+    // Reset cursor position
+    SetConsoleCursorPosition(hConsoleOut, coord);
 
     return 0;
 }
