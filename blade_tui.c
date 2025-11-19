@@ -39,6 +39,10 @@ int console_height = 25;
 HANDLE hConsoleOut;
 HANDLE hConsoleIn;
 
+// App State
+// MOVED TO GLOBAL so CtrlHandler can access it
+volatile int running = 1; 
+
 // Search State
 volatile long active_workers = 0;
 volatile long finished_scanning = 0;
@@ -181,12 +185,30 @@ unsigned __stdcall worker_thread(void *arg) {
                 FindClose(hFind);
             }
         } else {
-            if (finished_scanning && queue_head == queue_tail) break;
+            // Also check running flag here to kill workers faster if necessary
+            if ((finished_scanning && queue_head == queue_tail) || !running) break;
             SwitchToThread();
         }
     }
     InterlockedDecrement(&active_workers);
     return 0;
+}
+
+// ==========================================
+// SIGNAL HANDLER (NEW)
+// ==========================================
+BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
+    switch (fdwCtrlType) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+            // Signal the main loop to stop
+            running = 0;
+            // Return TRUE to tell Windows "We handled this, don't terminate immediately"
+            return TRUE;
+        default:
+            return FALSE;
+    }
 }
 
 // ==========================================
@@ -279,6 +301,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // REGISTER CTRL+C HANDLER
+    SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
     strcpy(TARGET_RAW, argv[2]);
     TARGET_LEN = strlen(TARGET_RAW);
     if (strchr(TARGET_RAW, '*') || strchr(TARGET_RAW, '?')) IS_WILDCARD = 1;
@@ -311,8 +336,8 @@ int main(int argc, char **argv) {
 
     INPUT_RECORD ir[128];
     DWORD recordsRead;
-    int running = 1;
-
+    
+    // Loop is controlled by global 'running' var
     while (running) {
         if (active_workers == 0 && queue_head == queue_tail) finished_scanning = 1;
         else finished_scanning = 0;
