@@ -12,7 +12,6 @@
 // ==========================================
 #define MAX_PATH_LEN 4096
 #define THREAD_COUNT 16
-#define QUEUE_SIZE 16384
 #define INITIAL_RESULT_CAPACITY 4096
 
 // Color Macros
@@ -38,10 +37,7 @@ int console_width = 80;
 int console_height = 25;
 HANDLE hConsoleOut;
 HANDLE hConsoleIn;
-
-// App State
-// MOVED TO GLOBAL so CtrlHandler can access it
-volatile int running = 1; 
+volatile int running = 1;
 
 // Search State
 volatile long active_workers = 0;
@@ -70,6 +66,15 @@ void add_result(const char *path) {
     strcpy(results[result_count].path, path);
     result_count++;
     LeaveCriticalSection(&result_lock);
+}
+
+void join_path(char *dest, const char *p1, const char *p2) {
+    size_t len = strlen(p1);
+    strcpy(dest, p1);
+    if (len > 0 && dest[len - 1] != '\\' && dest[len - 1] != '/') {
+        strcat(dest, "\\");
+    }
+    strcat(dest, p2);
 }
 
 // ==========================================
@@ -116,29 +121,49 @@ int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len)
 }
 
 // ==========================================
-// WORK QUEUE
+// DYNAMIC WORK QUEUE (Linked List)
 // ==========================================
-typedef struct { char path[MAX_PATH_LEN]; } Job;
-Job job_queue[QUEUE_SIZE];
-volatile long queue_head = 0;
-volatile long queue_tail = 0;
+typedef struct QueueNode {
+    char *path;
+    struct QueueNode *next;
+} QueueNode;
+
+QueueNode *q_head = NULL;
+QueueNode *q_tail = NULL;
 CRITICAL_SECTION queue_lock;
+volatile long queue_size = 0;
 
 void push_job(const char *path) {
+    QueueNode *node = (QueueNode*)malloc(sizeof(QueueNode));
+    if (!node) return;
+    
+    node->path = _strdup(path);
+    node->next = NULL;
+
     EnterCriticalSection(&queue_lock);
-    int idx = queue_tail % QUEUE_SIZE;
-    strcpy(job_queue[idx].path, path);
-    queue_tail++;
+    if (q_tail) {
+        q_tail->next = node;
+        q_tail = node;
+    } else {
+        q_head = q_tail = node;
+    }
+    queue_size++; // Just for debug/stats if needed
     LeaveCriticalSection(&queue_lock);
 }
 
 int pop_job(char *out_path) {
     int found = 0;
     EnterCriticalSection(&queue_lock);
-    if (queue_head < queue_tail) {
-        int idx = queue_head % QUEUE_SIZE;
-        strcpy(out_path, job_queue[idx].path);
-        queue_head++;
+    if (q_head) {
+        QueueNode *node = q_head;
+        strcpy(out_path, node->path);
+        
+        q_head = node->next;
+        if (q_head == NULL) q_tail = NULL;
+        
+        free(node->path);
+        free(node);
+        queue_size--;
         found = 1;
     }
     LeaveCriticalSection(&queue_lock);
@@ -151,13 +176,15 @@ int pop_job(char *out_path) {
 unsigned __stdcall worker_thread(void *arg) {
     char current_dir[MAX_PATH_LEN];
     char search_path[MAX_PATH_LEN];
+    char full_path[MAX_PATH_LEN];
     WIN32_FIND_DATAA find_data;
     HANDLE hFind;
 
     InterlockedIncrement(&active_workers);
-    while (1) {
+    while (running) {
         if (pop_job(current_dir)) {
-            snprintf(search_path, MAX_PATH_LEN, "%s\\*", current_dir);
+            join_path(search_path, current_dir, "*");
+
             hFind = FindFirstFileExA(search_path, FindExInfoBasic, &find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
@@ -165,28 +192,34 @@ unsigned __stdcall worker_thread(void *arg) {
                         if (find_data.cFileName[1] == '\0') continue;
                         if (find_data.cFileName[1] == '.' && find_data.cFileName[2] == '\0') continue;
                     }
+                    
                     int match = 0;
                     if (IS_WILDCARD) match = fast_glob_match(find_data.cFileName, TARGET_RAW);
                     else match = avx2_strcasestr(find_data.cFileName, TARGET_LOWER, TARGET_LEN);
 
                     if (match) {
-                        char full_path[MAX_PATH_LEN];
-                        snprintf(full_path, MAX_PATH_LEN, "%s\\%s", current_dir, find_data.cFileName);
+                        join_path(full_path, current_dir, find_data.cFileName);
                         add_result(full_path);
                     }
                     
                     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                        char new_path[MAX_PATH_LEN];
-                        if (snprintf(new_path, MAX_PATH_LEN, "%s\\%s", current_dir, find_data.cFileName) < MAX_PATH_LEN) {
-                            push_job(new_path);
+                        // Skip Reparse Points (Junctions) to avoid loops/duplicates
+                        if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                            char new_dir_path[MAX_PATH_LEN];
+                            join_path(new_dir_path, current_dir, find_data.cFileName);
+                            push_job(new_dir_path);
                         }
                     }
-                } while (FindNextFileA(hFind, &find_data));
+                } while (FindNextFileA(hFind, &find_data) && running);
                 FindClose(hFind);
             }
         } else {
-            // Also check running flag here to kill workers faster if necessary
-            if ((finished_scanning && queue_head == queue_tail) || !running) break;
+            // Check if we are done
+            EnterCriticalSection(&queue_lock);
+            int empty = (q_head == NULL);
+            LeaveCriticalSection(&queue_lock);
+
+            if (finished_scanning && empty) break;
             SwitchToThread();
         }
     }
@@ -195,20 +228,14 @@ unsigned __stdcall worker_thread(void *arg) {
 }
 
 // ==========================================
-// SIGNAL HANDLER (NEW)
+// SIGNAL HANDLER
 // ==========================================
 BOOL WINAPI CtrlHandler(DWORD fdwCtrlType) {
-    switch (fdwCtrlType) {
-        case CTRL_C_EVENT:
-        case CTRL_BREAK_EVENT:
-        case CTRL_CLOSE_EVENT:
-            // Signal the main loop to stop
-            running = 0;
-            // Return TRUE to tell Windows "We handled this, don't terminate immediately"
-            return TRUE;
-        default:
-            return FALSE;
+    if (fdwCtrlType == CTRL_C_EVENT || fdwCtrlType == CTRL_BREAK_EVENT || fdwCtrlType == CTRL_CLOSE_EVENT) {
+        running = 0;
+        return TRUE;
     }
+    return FALSE;
 }
 
 // ==========================================
@@ -277,17 +304,12 @@ void open_selection() {
     char absolute_path[MAX_PATH_LEN];
     char *file_part;
     
-    // FORCE ABSOLUTE PATH
     GetFullPathNameA(results[selected_index].path, MAX_PATH_LEN, absolute_path, &file_part);
-
-    // NORMALIZE SLASHES
     for (int i = 0; absolute_path[i]; i++) {
         if (absolute_path[i] == '/') absolute_path[i] = '\\';
     }
-
     char param[MAX_PATH_LEN + 32];
     snprintf(param, sizeof(param), "/select,\"%s\"", absolute_path);
-    
     ShellExecuteA(NULL, "open", "explorer.exe", param, NULL, SW_SHOWDEFAULT);
 }
 
@@ -301,7 +323,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // REGISTER CTRL+C HANDLER
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
     strcpy(TARGET_RAW, argv[2]);
@@ -328,7 +349,15 @@ int main(int argc, char **argv) {
     console_width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     console_height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
 
-    push_job(argv[1]);
+    // Clean Input Path
+    char start_dir[MAX_PATH_LEN];
+    strcpy(start_dir, argv[1]);
+    size_t start_len = strlen(start_dir);
+    if (start_len > 1 && start_dir[start_len-1] == '\\') {
+        start_dir[start_len-1] = '\0';
+    }
+    push_job(start_dir);
+
     HANDLE threads[THREAD_COUNT];
     for (int i = 0; i < THREAD_COUNT; i++) {
         threads[i] = (HANDLE)_beginthreadex(NULL, 0, worker_thread, NULL, 0, NULL);
@@ -336,10 +365,13 @@ int main(int argc, char **argv) {
 
     INPUT_RECORD ir[128];
     DWORD recordsRead;
-    
-    // Loop is controlled by global 'running' var
+
     while (running) {
-        if (active_workers == 0 && queue_head == queue_tail) finished_scanning = 1;
+        EnterCriticalSection(&queue_lock);
+        int empty = (q_head == NULL);
+        LeaveCriticalSection(&queue_lock);
+
+        if (active_workers == 0 && empty) finished_scanning = 1;
         else finished_scanning = 0;
 
         DWORD events = 0;
@@ -361,9 +393,7 @@ int main(int argc, char **argv) {
                          selected_index += 10;
                          if (selected_index >= result_count) selected_index = result_count - 1;
                     }
-                    else if (vk == VK_RETURN) {
-                        open_selection();
-                    }
+                    else if (vk == VK_RETURN) open_selection();
                 }
             }
         }
@@ -372,26 +402,15 @@ int main(int argc, char **argv) {
         Sleep(16); 
     }
 
-    // ==========================================
-    // CLEANUP & EXIT
-    // ==========================================
-    
-    // 1. Restore Cursor Visibility
+    // Cleanup
     cursorInfo.bVisible = TRUE;
     SetConsoleCursorInfo(hConsoleOut, &cursorInfo);
-
-    // 2. Reset Attributes (Standard Grey on Black)
     SetConsoleTextAttribute(hConsoleOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
-
-    // 3. Clear the Screen
     DWORD written;
     COORD coord = {0, 0};
     DWORD size = console_width * console_height;
-    // Fill with spaces
     FillConsoleOutputCharacterA(hConsoleOut, ' ', size, coord, &written);
-    // Fill with standard attributes
     FillConsoleOutputAttribute(hConsoleOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE, size, coord, &written);
-    // Reset cursor position
     SetConsoleCursorPosition(hConsoleOut, coord);
 
     return 0;
