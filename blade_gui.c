@@ -8,6 +8,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <immintrin.h>
+#include <shlobj.h> // REQUIRED FOR FOLDER PICKER
 
 // ==========================================
 // CONFIGURATION
@@ -16,33 +17,32 @@
 #define THREAD_COUNT 16
 #define INITIAL_CAPACITY 65536
 #define FONT_NAME "Segoe UI"
-#define FONT_SIZE 18 // Height in pixels
+#define FONT_SIZE 18 
 #define BG_COLOR RGB(20, 20, 20)
 #define FG_COLOR RGB(220, 220, 220)
 #define ACCENT_COLOR RGB(0, 120, 215)
 #define SELECTED_TEXT_COLOR RGB(255, 255, 255)
+#define HEADER_HEIGHT 60 // Increased to fit Path info
 
 // ==========================================
 // GLOBAL STATE
 // ==========================================
 typedef struct { char path[MAX_PATH_LEN]; } Result;
 
-// Data
 Result *results = NULL;
 volatile long result_count = 0;
 long result_capacity = 0;
 CRITICAL_SECTION result_lock;
 
-// Search State
 volatile int running = 1;
 volatile long active_workers = 0;
-volatile long search_generation = 0; // For cancelling old searches
+volatile long search_generation = 0; 
+
 char root_directory[MAX_PATH_LEN];
 char search_term[256] = {0};
 char search_term_lower[256] = {0};
 int is_wildcard = 0;
 
-// UI State
 HWND hMainWnd;
 int selected_index = 0;
 int scroll_offset = 0;
@@ -50,20 +50,16 @@ int window_width = 800;
 int window_height = 600;
 int max_visible_items = 0;
 HFONT hFont;
+HFONT hFontSmall; // New smaller font for path display
 
-// Double Buffering
 HDC hdcBack = NULL;
 HBITMAP hbmBack = NULL;
 HBITMAP hbmOld = NULL;
 
 // ==========================================
-// PERFORMANCE SEARCH LOGIC (AVX2 + GLOB)
+// SEARCH LOGIC (AVX2 + GLOB)
 // ==========================================
-// (Same engines as your CLI, optimized for generation checking)
-
 int fast_glob_match(const char *text, const char *pattern) {
-    // ... [Keep your existing glob_match code here] ...
-    // Copied for completeness:
     while (*pattern) {
         if (*pattern == '*') {
             while (*pattern == '*') pattern++;
@@ -84,7 +80,6 @@ int fast_glob_match(const char *text, const char *pattern) {
 }
 
 int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
-    // ... [Keep your existing AVX2 code here] ...
     if (needle_len == 0) return 1;
     char first_char = tolower(needle[0]);
     __m256i vec_first = _mm256_set1_epi8(first_char);
@@ -127,16 +122,13 @@ void add_result(const char *path) {
         strcpy(results[result_count].path, path);
         result_count++;
     }
-    // Trigger repaint if this result might be visible (latency optimization)
     if (result_count < 50 || result_count % 100 == 0) {
         InvalidateRect(hMainWnd, NULL, FALSE);
     }
     LeaveCriticalSection(&result_lock);
 }
 
-// Recursive Directory Scan (Queue-less recursion for simpler state mgmt in GUI)
 void scan_dir(char *path, long my_gen) {
-    // ABORT IF GENERATION CHANGED (User typed something new)
     if (my_gen != search_generation || !running) return;
 
     char search_path[MAX_PATH_LEN];
@@ -147,8 +139,7 @@ void scan_dir(char *path, long my_gen) {
     if (hFind == INVALID_HANDLE_VALUE) return;
 
     do {
-        if (my_gen != search_generation) break; // Hot path check
-
+        if (my_gen != search_generation) break;
         if (find_data.cFileName[0] == '.') continue;
 
         int match = 0;
@@ -171,35 +162,81 @@ void scan_dir(char *path, long my_gen) {
 }
 
 unsigned __stdcall worker_thread(void *arg) {
-    // Simple worker: just waits for a generation change, then scans
-    // In a real GUI, we'd use a proper task queue, but for this example, 
-    // we'll just have one master scanner for simplicity or launch scan on input.
-    // To keep it simple for this "single file" demo, we will launch a thread per keystroke 
-    // that cancels the previous one via the generation ID.
-    
     long my_gen = (long)(intptr_t)arg;
     InterlockedIncrement(&active_workers);
-    
     scan_dir(root_directory, my_gen);
-    
     InterlockedDecrement(&active_workers);
-    // Force final repaint to ensure "Scanning..." text disappears
     InvalidateRect(hMainWnd, NULL, FALSE);
     return 0;
 }
 
 void start_search_thread() {
-    // Launch a detached thread
     _beginthreadex(NULL, 0, worker_thread, (void*)(intptr_t)search_generation, 0, NULL);
 }
 
 // ==========================================
-// GRAPHICS (GDI DOUBLE BUFFERED)
+// FOLDER PICKER 
+// ==========================================
+
+// Keep the callback to handle the default selection
+int CALLBACK BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM lParam, LPARAM lpData) {
+    if (uMsg == BFFM_INITIALIZED) {
+        // Select the current directory if it exists
+        SendMessageA(hwnd, BFFM_SETSELECTIONA, (WPARAM)TRUE, (LPARAM)lpData);
+    }
+    return 0;
+}
+
+void select_root_folder() {
+    char buffer[MAX_PATH];
+    BROWSEINFOA bi = { 0 };
+    LPITEMIDLIST pidlMyComputer = NULL;
+    IMalloc *imalloc = 0;
+
+    // 1. Get the Memory Allocator (Standard COM way to free shell memory)
+    if (FAILED(SHGetMalloc(&imalloc))) return;
+
+    // 2. Get the PIDL for "This PC" (CSIDL_DRIVES)
+    // This tells the dialog to start the tree at "My Computer" level
+    if (SUCCEEDED(SHGetSpecialFolderLocation(hMainWnd, CSIDL_DRIVES, &pidlMyComputer))) {
+        bi.pidlRoot = pidlMyComputer;
+    }
+
+    bi.hwndOwner = hMainWnd;
+    bi.lpszTitle = "Select Search Directory";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI | BIF_NONEWFOLDERBUTTON;
+    bi.lpfn = BrowseCallbackProc;
+    bi.lParam = (LPARAM)root_directory; // Pre-select current folder
+
+    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+    
+    if (pidl != 0) {
+        if (SHGetPathFromIDListA(pidl, buffer)) {
+            strcpy(root_directory, buffer);
+            
+            // Formatting: Remove trailing slash unless it's root (e.g. "C:\" is fine, "C:\Users\" -> "C:\Users")
+            size_t len = strlen(root_directory);
+            if (len > 3 && root_directory[len-1] == '\\') root_directory[len-1] = 0;
+
+            reset_search();
+            if (strlen(search_term) > 0) start_search_thread();
+        }
+        imalloc->lpVtbl->Free(imalloc, pidl);
+    }
+
+    // 3. Clean up the "This PC" PIDL
+    if (pidlMyComputer) {
+        imalloc->lpVtbl->Free(imalloc, pidlMyComputer);
+    }
+    imalloc->lpVtbl->Release(imalloc);
+}
+
+// ==========================================
+// GRAPHICS
 // ==========================================
 void InitDoubleBuffering(HDC hdc, int w, int h) {
     if (hdcBack) DeleteDC(hdcBack);
     if (hbmBack) DeleteObject(hbmBack);
-
     hdcBack = CreateCompatibleDC(hdc);
     hbmBack = CreateCompatibleBitmap(hdc, w, h);
     hbmOld = (HBITMAP)SelectObject(hdcBack, hbmBack);
@@ -214,27 +251,33 @@ void Render(HDC hdcDest) {
     FillRect(hdcBack, &rc, bgBrush);
     DeleteObject(bgBrush);
 
-    // 2. Draw Header / Search Box
-    int header_height = 40;
-    RECT rcHeader = {0, 0, window_width, header_height};
+    // 2. Draw Header
+    RECT rcHeader = {0, 0, window_width, HEADER_HEIGHT};
     HBRUSH headerBrush = CreateSolidBrush(RGB(35, 35, 35));
     FillRect(hdcBack, &rcHeader, headerBrush);
     DeleteObject(headerBrush);
 
     SetBkMode(hdcBack, TRANSPARENT);
+    
+    // Line 1: Search Term
     SelectObject(hdcBack, hFont);
     SetTextColor(hdcBack, FG_COLOR);
-
-    // Draw Search Term
-    TextOutA(hdcBack, 10, 10, search_term, strlen(search_term));
+    TextOutA(hdcBack, 10, 5, search_term, strlen(search_term));
     
-    // Draw Cursor (Blinking logic omitted for raw speed/simplicity, just a static pipe)
-    int search_len = strlen(search_term);
+    // Cursor
     SIZE sz;
-    GetTextExtentPoint32A(hdcBack, search_term, search_len, &sz);
-    TextOutA(hdcBack, 10 + sz.cx, 10, "_", 1);
+    GetTextExtentPoint32A(hdcBack, search_term, strlen(search_term), &sz);
+    TextOutA(hdcBack, 10 + sz.cx, 5, "_", 1);
 
-    // Draw Status
+    // Line 2: Current Path (Small Text)
+    SelectObject(hdcBack, hFontSmall);
+    SetTextColor(hdcBack, RGB(150, 150, 150));
+    char path_display[MAX_PATH_LEN + 32];
+    snprintf(path_display, sizeof(path_display), "Searching in: %s (Ctrl+O to change)", root_directory);
+    TextOutA(hdcBack, 10, 32, path_display, strlen(path_display));
+
+    // Status (Right Aligned)
+    SelectObject(hdcBack, hFont);
     char status[128];
     snprintf(status, 128, "%ld hits %s", result_count, active_workers > 0 ? "(Scanning)" : "");
     SIZE szStatus;
@@ -242,17 +285,17 @@ void Render(HDC hdcDest) {
     SetTextColor(hdcBack, RGB(100, 100, 100));
     TextOutA(hdcBack, window_width - szStatus.cx - 10, 10, status, strlen(status));
 
-    // 3. Draw List (Virtual Mode)
+    // 3. Draw List
     int item_h = FONT_SIZE + 10;
-    int start_y = header_height;
-    max_visible_items = (window_height - header_height) / item_h;
+    int start_y = HEADER_HEIGHT;
+    max_visible_items = (window_height - HEADER_HEIGHT) / item_h;
 
     EnterCriticalSection(&result_lock);
-    
-    // Clamp scroll
     if (scroll_offset > result_count - max_visible_items) scroll_offset = result_count - max_visible_items;
     if (scroll_offset < 0) scroll_offset = 0;
 
+    SelectObject(hdcBack, hFont); // Back to main font
+    
     for (int i = 0; i < max_visible_items; i++) {
         int idx = scroll_offset + i;
         if (idx >= result_count) break;
@@ -260,7 +303,6 @@ void Render(HDC hdcDest) {
         int y = start_y + (i * item_h);
         RECT rcItem = {0, y, window_width, y + item_h};
 
-        // Selection Highlight
         if (idx == selected_index) {
             HBRUSH selBrush = CreateSolidBrush(ACCENT_COLOR);
             FillRect(hdcBack, &rcItem, selBrush);
@@ -269,15 +311,10 @@ void Render(HDC hdcDest) {
         } else {
             SetTextColor(hdcBack, FG_COLOR);
         }
-
-        // Draw Text
-        // Simple optimization: Truncate path if too long for screen? 
-        // For now, just draw. GDI clips automatically.
         TextOutA(hdcBack, 10, y + 5, results[idx].path, strlen(results[idx].path));
     }
     LeaveCriticalSection(&result_lock);
 
-    // 4. Blit to Screen
     BitBlt(hdcDest, 0, 0, window_width, window_height, hdcBack, 0, 0, SRCCOPY);
 }
 
@@ -288,6 +325,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE:
             hFont = CreateFontA(FONT_SIZE, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            hFontSmall = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
                                CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             return 0;
@@ -302,9 +342,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
 
-        case WM_ERASEBKGND:
-            return 1; // Prevent flickering, we handle paint
-
+        case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -315,6 +353,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CHAR: {
             if (wParam == VK_ESCAPE) { PostQuitMessage(0); return 0; }
+            // Handle Ctrl+O here if it comes through as char 15, OR rely on KeyDown
+            // Usually safest to do text input here
             if (wParam == VK_BACK) {
                 int len = strlen(search_term);
                 if (len > 0) search_term[len - 1] = 0;
@@ -325,22 +365,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     search_term[len+1] = 0;
                 }
             } else {
-                return 0;
+                return 0; 
             }
 
-            // Update Wildcard/Lower state
             is_wildcard = (strchr(search_term, '*') || strchr(search_term, '?'));
             for(int i=0; search_term[i]; i++) search_term_lower[i] = tolower(search_term[i]);
             search_term_lower[strlen(search_term)] = 0;
 
             reset_search();
             if (strlen(search_term) > 0) start_search_thread();
-            
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
 
         case WM_KEYDOWN: {
+            // HOTKEY: Ctrl + O (Open Folder)
+            if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                select_root_folder();
+                return 0;
+            }
+
             EnterCriticalSection(&result_lock);
             if (wParam == VK_DOWN) {
                 if (selected_index < result_count - 1) selected_index++;
@@ -350,20 +394,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (selected_index > 0) selected_index--;
                 if (selected_index < scroll_offset) scroll_offset--;
             }
-            else if (wParam == VK_PRIOR) { // Page Up
+            else if (wParam == VK_PRIOR) { 
                 selected_index -= max_visible_items;
                 scroll_offset -= max_visible_items;
                 if (selected_index < 0) selected_index = 0;
                 if (scroll_offset < 0) scroll_offset = 0;
             }
-            else if (wParam == VK_NEXT) { // Page Down
+            else if (wParam == VK_NEXT) { 
                 selected_index += max_visible_items;
                 scroll_offset += max_visible_items;
                 if (selected_index >= result_count) selected_index = result_count - 1;
                 if (scroll_offset > result_count - max_visible_items) scroll_offset = result_count - max_visible_items;
             }
             else if (wParam == VK_RETURN && result_count > 0) {
-                // Open Explorer
                 char param[MAX_PATH_LEN + 32];
                 snprintf(param, sizeof(param), "/select,\"%s\"", results[selected_index].path);
                 ShellExecuteA(NULL, "open", "explorer.exe", param, NULL, SW_SHOWDEFAULT);
@@ -380,41 +423,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// ==========================================
-// ENTRY POINT
-// ==========================================
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
-    // Setup Data
     results = (Result*)malloc(INITIAL_CAPACITY * sizeof(Result));
     result_capacity = INITIAL_CAPACITY;
     InitializeCriticalSection(&result_lock);
 
-    // Get initial directory (from args or current)
     if (__argc > 1) strcpy(root_directory, __argv[1]);
     else GetCurrentDirectoryA(MAX_PATH_LEN, root_directory);
 
-    // Register Window Class
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.lpszClassName = "BladeWindowClass";
-    // CS_HREDRAW | CS_VREDRAW causes full repaint on resize (good for layout)
     wc.style = CS_HREDRAW | CS_VREDRAW; 
     RegisterClassA(&wc);
 
-    // Create Window
-    // WS_EX_COMPOSITED enables automatic double-buffering at OS level (XP+)
-    // But we did it manually above for maximum control. 
     hMainWnd = CreateWindowExA(0, "BladeWindowClass", "Blade Search",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, hInstance, NULL);
 
-    // High Priority UI Thread
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
-    // Message Loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
