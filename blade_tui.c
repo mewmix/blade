@@ -30,6 +30,14 @@ volatile long result_count = 0;
 long result_capacity = 0;
 CRITICAL_SECTION result_lock;
 
+// Filter State
+int is_filtering = 0;
+char filter_text[256] = {0};
+int filter_mode = 0; // 0 = Name, 1 = Path
+long *filtered_indices = NULL; // Pointer to indices in 'results'
+long filtered_count = 0;
+long filtered_capacity = 0;
+
 // UI State
 int selected_index = 0;
 int scroll_offset = 0;
@@ -46,6 +54,66 @@ char TARGET_RAW[256];
 char TARGET_LOWER[256];
 size_t TARGET_LEN;
 int IS_WILDCARD = 0;
+
+// ==========================================
+// SEARCH ENGINES
+// ==========================================
+// Glob Matcher (Wildcards: *, ?) - Case Insensitive
+int fast_glob_match(const char *text, const char *pattern) {
+    while (*pattern) {
+        if (*pattern == '*') {
+            while (*pattern == '*') pattern++;
+            if (!*pattern) return 1;
+            while (*text) {
+                if (fast_glob_match(text, pattern)) return 1;
+                text++;
+            }
+            return 0;
+        }
+        char t = tolower((unsigned char)*text);
+        char p = tolower((unsigned char)*pattern);
+        if (t != p && *pattern != '?') return 0;
+        if (!*text) return 0;
+        text++; pattern++;
+    }
+    return !*text;
+}
+
+// Substring Matcher - Case Insensitive
+const char* stristr(const char* haystack, const char* needle) {
+    if (!*needle) return haystack;
+    for (; *haystack; ++haystack) {
+        if (tolower(*haystack) == tolower(*needle)) {
+            const char *h, *n;
+            for (h = haystack, n = needle; *h && *n; ++h, ++n) {
+                if (tolower(*h) != tolower(*n)) break;
+            }
+            if (!*n) return haystack;
+        }
+    }
+    return NULL;
+}
+
+// AVX2 Substring Matcher (For main search)
+int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
+    if (needle_len == 0) return 1;
+    char first_char = tolower(needle[0]);
+    __m256i vec_first = _mm256_set1_epi8(first_char);
+    __m256i vec_case_mask = _mm256_set1_epi8(0x20);
+    size_t i = 0;
+    for (; haystack[i]; i += 32) {
+        __m256i block = _mm256_loadu_si256((const __m256i*)(haystack + i));
+        __m256i block_lower = _mm256_or_si256(block, vec_case_mask);
+        __m256i eq = _mm256_cmpeq_epi8(vec_first, block_lower);
+        unsigned int mask = _mm256_movemask_epi8(eq);
+        while (mask) {
+            int bit_pos = __builtin_ctz(mask);
+            if (_strnicmp(haystack + i + bit_pos, needle, needle_len) == 0) return 1;
+            mask &= ~(1 << bit_pos);
+        }
+    }
+    return 0;
+}
 
 // ==========================================
 // HELPERS
@@ -78,50 +146,65 @@ void join_path(char *dest, const char *p1, const char *p2) {
 }
 
 // ==========================================
-// SEARCH ENGINES
+// FILTER LOGIC (UPDATED)
 // ==========================================
-int fast_glob_match(const char *text, const char *pattern) {
-    while (*pattern) {
-        if (*pattern == '*') {
-            while (*pattern == '*') pattern++;
-            if (!*pattern) return 1;
-            while (*text) {
-                if (fast_glob_match(text, pattern)) return 1;
-                text++;
+void update_filter(int reset_selection) {
+    EnterCriticalSection(&result_lock);
+    
+    if (filtered_capacity < result_count) {
+        long new_cap = result_count + 1024;
+        long *new_ptr = (long*)realloc(filtered_indices, new_cap * sizeof(long));
+        if (new_ptr) {
+            filtered_indices = new_ptr;
+            filtered_capacity = new_cap;
+        }
+    }
+
+    filtered_count = 0;
+    int has_wildcard = (strchr(filter_text, '*') || strchr(filter_text, '?'));
+
+    if (strlen(filter_text) == 0) {
+        for (long i = 0; i < result_count; i++) filtered_indices[i] = i;
+        filtered_count = result_count;
+    } else {
+        for (long i = 0; i < result_count; i++) {
+            const char *search_haystack = results[i].path;
+            
+            // Filter Mode: 0=Name, 1=Path
+            if (filter_mode == 0) {
+                const char *last_slash = strrchr(search_haystack, '\\');
+                if (last_slash) search_haystack = last_slash + 1;
             }
-            return 0;
-        }
-        char t = tolower((unsigned char)*text);
-        char p = tolower((unsigned char)*pattern);
-        if (t != p && *pattern != '?') return 0;
-        if (!*text) return 0;
-        text++; pattern++;
-    }
-    return !*text;
-}
 
-int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
-    if (needle_len == 0) return 1;
-    char first_char = tolower(needle[0]);
-    __m256i vec_first = _mm256_set1_epi8(first_char);
-    __m256i vec_case_mask = _mm256_set1_epi8(0x20);
-    size_t i = 0;
-    for (; haystack[i]; i += 32) {
-        __m256i block = _mm256_loadu_si256((const __m256i*)(haystack + i));
-        __m256i block_lower = _mm256_or_si256(block, vec_case_mask);
-        __m256i eq = _mm256_cmpeq_epi8(vec_first, block_lower);
-        unsigned int mask = _mm256_movemask_epi8(eq);
-        while (mask) {
-            int bit_pos = __builtin_ctz(mask);
-            if (_strnicmp(haystack + i + bit_pos, needle, needle_len) == 0) return 1;
-            mask &= ~(1 << bit_pos);
+            // Hybrid Matcher: Use Glob if wildcards exist, else Substring
+            int match = 0;
+            if (has_wildcard) {
+                match = fast_glob_match(search_haystack, filter_text);
+            } else {
+                match = (stristr(search_haystack, filter_text) != NULL);
+            }
+
+            if (match) {
+                filtered_indices[filtered_count++] = i;
+            }
         }
     }
-    return 0;
+    
+    if (reset_selection) {
+        selected_index = 0;
+        scroll_offset = 0;
+    } else {
+        // Clamp if filtered count shrank
+        if (filtered_count > 0 && selected_index >= filtered_count) {
+            selected_index = filtered_count - 1;
+        }
+    }
+    
+    LeaveCriticalSection(&result_lock);
 }
 
 // ==========================================
-// DYNAMIC WORK QUEUE (Linked List)
+// DYNAMIC WORK QUEUE
 // ==========================================
 typedef struct QueueNode {
     char *path;
@@ -131,12 +214,10 @@ typedef struct QueueNode {
 QueueNode *q_head = NULL;
 QueueNode *q_tail = NULL;
 CRITICAL_SECTION queue_lock;
-volatile long queue_size = 0;
 
 void push_job(const char *path) {
     QueueNode *node = (QueueNode*)malloc(sizeof(QueueNode));
     if (!node) return;
-    
     node->path = _strdup(path);
     node->next = NULL;
 
@@ -147,7 +228,6 @@ void push_job(const char *path) {
     } else {
         q_head = q_tail = node;
     }
-    queue_size++; // Just for debug/stats if needed
     LeaveCriticalSection(&queue_lock);
 }
 
@@ -157,13 +237,10 @@ int pop_job(char *out_path) {
     if (q_head) {
         QueueNode *node = q_head;
         strcpy(out_path, node->path);
-        
         q_head = node->next;
         if (q_head == NULL) q_tail = NULL;
-        
         free(node->path);
         free(node);
-        queue_size--;
         found = 1;
     }
     LeaveCriticalSection(&queue_lock);
@@ -184,7 +261,6 @@ unsigned __stdcall worker_thread(void *arg) {
     while (running) {
         if (pop_job(current_dir)) {
             join_path(search_path, current_dir, "*");
-
             hFind = FindFirstFileExA(search_path, FindExInfoBasic, &find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
@@ -203,7 +279,6 @@ unsigned __stdcall worker_thread(void *arg) {
                     }
                     
                     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                        // Skip Reparse Points (Junctions) to avoid loops/duplicates
                         if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
                             char new_dir_path[MAX_PATH_LEN];
                             join_path(new_dir_path, current_dir, find_data.cFileName);
@@ -214,11 +289,9 @@ unsigned __stdcall worker_thread(void *arg) {
                 FindClose(hFind);
             }
         } else {
-            // Check if we are done
             EnterCriticalSection(&queue_lock);
             int empty = (q_head == NULL);
             LeaveCriticalSection(&queue_lock);
-
             if (finished_scanning && empty) break;
             SwitchToThread();
         }
@@ -259,30 +332,55 @@ void render_ui() {
     }
 
     // Header
-    char header[256];
-    snprintf(header, 256, " blade %s (%s) :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
-             VERSION, COMMIT_SHA, TARGET_RAW, result_count);
+    char header[512];
+    long display_total = is_filtering ? filtered_count : result_count;
+    snprintf(header, 512, " blade %s (%s) :: Search: %s :: Found: %ld%s", 
+             VERSION, COMMIT_SHA, TARGET_RAW, display_total, 
+             finished_scanning ? "" : " (Scanning...)");
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
         buffer[i].Char.AsciiChar = header[i];
         buffer[i].Attributes = BACKGROUND_RED | FOREGROUND_INTENSITY | FOREGROUND_WHITE;
     }
 
+    // Filter Bar
+    int list_start_y = 1;
+    int list_height = console_height - 1;
+    
+    if (is_filtering) {
+        char filter_bar[512];
+        char *mode_str = (filter_mode == 0) ? "Name" : "Path";
+        snprintf(filter_bar, 512, " FILTER [%s]: %s_", mode_str, filter_text);
+        
+        for (int i = 0; i < console_width; i++) {
+            int buf_idx = (console_height - 1) * console_width + i;
+            if (i < strlen(filter_bar)) {
+                buffer[buf_idx].Char.AsciiChar = filter_bar[i];
+            } else {
+                buffer[buf_idx].Char.AsciiChar = ' ';
+            }
+            buffer[buf_idx].Attributes = BACKGROUND_BLUE | FOREGROUND_INTENSITY | FOREGROUND_WHITE;
+        }
+        list_height--; 
+    }
+
     // List
     EnterCriticalSection(&result_lock);
-    long count = result_count;
+    long count = is_filtering ? filtered_count : result_count;
     
     if (selected_index < scroll_offset) scroll_offset = selected_index;
-    if (selected_index >= scroll_offset + (console_height - 2)) scroll_offset = selected_index - (console_height - 3);
+    if (selected_index >= scroll_offset + (list_height)) scroll_offset = selected_index - (list_height - 1);
     if (scroll_offset < 0) scroll_offset = 0;
 
-    int y = 1;
-    for (int i = scroll_offset; i < count && y < console_height; i++) {
+    int y = list_start_y;
+    for (int i = scroll_offset; i < count && y < (list_start_y + list_height); i++) {
         int is_selected = (i == selected_index);
         WORD attr = FOREGROUND_GREEN | FOREGROUND_INTENSITY;
         if (is_selected) attr = BACKGROUND_GREEN | FOREGROUND_BLACK;
 
-        char *text = results[i].path;
+        long real_index = is_filtering ? filtered_indices[i] : i;
+        char *text = results[real_index].path;
+
         int len = strlen(text);
         for (int x = 0; x < len && x < console_width; x++) {
             buffer[y * console_width + x].Char.AsciiChar = text[x];
@@ -299,12 +397,15 @@ void render_ui() {
 }
 
 void open_selection() {
-    if (result_count == 0) return;
+    long count = is_filtering ? filtered_count : result_count;
+    if (count == 0) return;
+    
+    long real_index = is_filtering ? filtered_indices[selected_index] : selected_index;
     
     char absolute_path[MAX_PATH_LEN];
     char *file_part;
     
-    GetFullPathNameA(results[selected_index].path, MAX_PATH_LEN, absolute_path, &file_part);
+    GetFullPathNameA(results[real_index].path, MAX_PATH_LEN, absolute_path, &file_part);
     for (int i = 0; absolute_path[i]; i++) {
         if (absolute_path[i] == '/') absolute_path[i] = '\\';
     }
@@ -333,6 +434,9 @@ int main(int argc, char **argv) {
 
     results = (Result*)malloc(INITIAL_RESULT_CAPACITY * sizeof(Result));
     result_capacity = INITIAL_RESULT_CAPACITY;
+    filtered_indices = (long*)malloc(INITIAL_RESULT_CAPACITY * sizeof(long));
+    filtered_capacity = INITIAL_RESULT_CAPACITY;
+
     InitializeCriticalSection(&queue_lock);
     InitializeCriticalSection(&result_lock);
 
@@ -349,7 +453,6 @@ int main(int argc, char **argv) {
     console_width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     console_height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
 
-    // Clean Input Path
     char start_dir[MAX_PATH_LEN];
     strcpy(start_dir, argv[1]);
     size_t start_len = strlen(start_dir);
@@ -373,6 +476,8 @@ int main(int argc, char **argv) {
 
         if (active_workers == 0 && empty) finished_scanning = 1;
         else finished_scanning = 0;
+        
+        if (is_filtering && !finished_scanning) update_filter(0); // 0 = Don't reset selection
 
         DWORD events = 0;
         GetNumberOfConsoleInputEvents(hConsoleIn, &events);
@@ -382,18 +487,74 @@ int main(int argc, char **argv) {
             for (DWORD i = 0; i < recordsRead; i++) {
                 if (ir[i].EventType == KEY_EVENT && ir[i].Event.KeyEvent.bKeyDown) {
                     WORD vk = ir[i].Event.KeyEvent.wVirtualKeyCode;
-                    if (vk == VK_ESCAPE) running = 0;
-                    else if (vk == VK_UP && selected_index > 0) selected_index--;
-                    else if (vk == VK_DOWN && selected_index < result_count - 1) selected_index++;
-                    else if (vk == VK_PRIOR) {
-                         selected_index -= 10;
-                         if (selected_index < 0) selected_index = 0;
+                    char ascii = ir[i].Event.KeyEvent.uChar.AsciiChar;
+                    DWORD ctrl = ir[i].Event.KeyEvent.dwControlKeyState;
+
+                    // 1. Global Hotkeys
+                    if (vk == 'F' && (ctrl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))) {
+                        is_filtering = !is_filtering;
+                        if (is_filtering) update_filter(1); // Reset selection on open
+                        continue;
                     }
-                    else if (vk == VK_NEXT) {
-                         selected_index += 10;
-                         if (selected_index >= result_count) selected_index = result_count - 1;
+                    if (vk == VK_ESCAPE) {
+                        if (is_filtering) {
+                            is_filtering = 0;
+                            memset(filter_text, 0, sizeof(filter_text));
+                            update_filter(1);
+                        } else {
+                            running = 0;
+                        }
+                        continue;
                     }
-                    else if (vk == VK_RETURN) open_selection();
+                    if (vk == VK_RETURN) {
+                        open_selection();
+                        continue;
+                    }
+
+                    // 2. Navigation (Always Active)
+                    long max_items = is_filtering ? filtered_count : result_count;
+                    
+                    if (vk == VK_UP && selected_index > 0) {
+                        selected_index--;
+                        continue;
+                    }
+                    if (vk == VK_DOWN && selected_index < max_items - 1) {
+                        selected_index++;
+                        continue;
+                    }
+                    if (vk == VK_PRIOR) { // Page Up
+                        selected_index -= 10;
+                        if (selected_index < 0) selected_index = 0;
+                        continue;
+                    }
+                    if (vk == VK_NEXT) { // Page Down
+                        selected_index += 10;
+                        if (selected_index >= max_items) selected_index = max_items - 1;
+                        continue;
+                    }
+
+                    // 3. Filter Text Input (Only if filtering)
+                    if (is_filtering) {
+                        if (vk == VK_TAB) {
+                            filter_mode = !filter_mode; 
+                            update_filter(1);
+                        }
+                        else if (vk == VK_BACK) {
+                            size_t len = strlen(filter_text);
+                            if (len > 0) {
+                                filter_text[len - 1] = '\0';
+                                update_filter(1);
+                            }
+                        }
+                        else if (isprint((unsigned char)ascii)) {
+                            size_t len = strlen(filter_text);
+                            if (len < 255) {
+                                filter_text[len] = ascii;
+                                filter_text[len + 1] = '\0';
+                                update_filter(1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -402,7 +563,6 @@ int main(int argc, char **argv) {
         Sleep(16); 
     }
 
-    // Cleanup
     cursorInfo.bVisible = TRUE;
     SetConsoleCursorInfo(hConsoleOut, &cursorInfo);
     SetConsoleTextAttribute(hConsoleOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
