@@ -274,6 +274,7 @@ void open_selection() {
 // ==========================================
 int main(int argc, char **argv) {
     if (argc < 3) {
+        printf("version %s (%s)\n", VERSION, COMMIT_SHA);
         printf("Usage: blade.exe <directory> <search_term>\n");
         return 1;
     }

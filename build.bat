@@ -5,7 +5,7 @@ rem Get Git Commit SHA
 for /f "delims=" %%i in ('git rev-parse HEAD') do set COMMIT_SHA=%%i
 
 rem Define Version
-set APP_VERSION=1.0.0
+set APP_VERSION=1.0.1
 
 rem Create version.h
 echo #define VERSION "%APP_VERSION%" > version.h
