@@ -5,6 +5,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <immintrin.h> // AVX2
+#include "version.h"
 
 // ==========================================
 // CONFIGURATION
@@ -210,8 +211,8 @@ void render_ui() {
 
     // Header
     char header[256];
-    snprintf(header, 256, " blade v3 :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
-             TARGET_RAW, result_count);
+    snprintf(header, 256, " blade %s (%s) :: Search: %s :: Found: %ld :: [ARROWS] Nav [ENTER] Open [ESC] Exit", 
+             VERSION, COMMIT_SHA, TARGET_RAW, result_count);
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
         buffer[i].Char.AsciiChar = header[i];

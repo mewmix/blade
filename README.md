@@ -12,6 +12,9 @@
 ### Download
 Grab the latest binary from the [Releases](https://github.com/mewmix/frostmourne/releases) page.
 
+### Installation
+For easy access from any terminal, add the `frostmourne` directory to your Windows `PATH` environment variable.
+
 ### Usage
 ```cmd
 ./frostmourne.exe <directory> <search_term>
