@@ -453,12 +453,24 @@ int main(int argc, char **argv) {
     console_width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     console_height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
 
+    // ==========================================
+    // PATH RESOLUTION (FIXED)
+    // ==========================================
     char start_dir[MAX_PATH_LEN];
-    strcpy(start_dir, argv[1]);
-    size_t start_len = strlen(start_dir);
-    if (start_len > 1 && start_dir[start_len-1] == '\\') {
-        start_dir[start_len-1] = '\0';
+    char *file_part;
+    
+    // Convert to absolute path immediately
+    DWORD result_len = GetFullPathNameA(argv[1], MAX_PATH_LEN, start_dir, &file_part);
+    if (result_len == 0) {
+        strcpy(start_dir, argv[1]);
+    } else {
+        // Normalize trailing slash logic for directories vs root
+        size_t len = strlen(start_dir);
+        if (len > 3 && start_dir[len - 1] == '\\') {
+            start_dir[len - 1] = '\0';
+        }
     }
+
     push_job(start_dir);
 
     HANDLE threads[THREAD_COUNT];
