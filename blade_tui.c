@@ -1,3 +1,8 @@
+// Force Windows Vista+ API availability (Required for Condition Variables)
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <windows.h>
 #include <process.h>
 #include <stdio.h>
@@ -15,6 +20,7 @@
 #define MAX_PATH_LEN 4096
 #define THREAD_COUNT 16
 #define INITIAL_RESULT_CAPACITY 4096
+#define WORKER_BATCH_SIZE 64 
 
 // Color Macros
 #define FOREGROUND_WHITE (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
@@ -28,11 +34,7 @@ typedef struct {
 } Result;
 
 Result *results = NULL;
-// ==========================================
-// HIGH PERFORMANCE STORAGE (SoA)
-// ==========================================
-// 32-byte alignment is required for AVX2 load/store operations
-uint64_t *file_sizes = NULL; // Manage capacity in sync with result_capacity
+uint64_t *file_sizes = NULL; // SoA: 32-byte aligned
 volatile long result_count = 0;
 long result_capacity = 0;
 CRITICAL_SECTION result_lock;
@@ -41,7 +43,7 @@ CRITICAL_SECTION result_lock;
 int is_filtering = 0;
 char filter_text[256] = {0};
 int filter_mode = 0; // 0 = Name, 1 = Path
-long *filtered_indices = NULL; // Pointer to indices in 'results'
+long *filtered_indices = NULL;
 long filtered_count = 0;
 long filtered_capacity = 0;
 
@@ -62,10 +64,13 @@ char TARGET_LOWER[256];
 size_t TARGET_LEN;
 int IS_WILDCARD = 0;
 
+// Forward Declarations
+void open_selection();
+void update_filter(int reset_selection);
+
 // ==========================================
 // SEARCH ENGINES
 // ==========================================
-// Glob Matcher (Wildcards: *, ?) - Case Insensitive
 int fast_glob_match(const char *text, const char *pattern) {
     while (*pattern) {
         if (*pattern == '*') {
@@ -86,7 +91,6 @@ int fast_glob_match(const char *text, const char *pattern) {
     return !*text;
 }
 
-// Substring Matcher - Case Insensitive
 const char* stristr(const char* haystack, const char* needle) {
     if (!*needle) return haystack;
     for (; *haystack; ++haystack) {
@@ -101,13 +105,13 @@ const char* stristr(const char* haystack, const char* needle) {
     return NULL;
 }
 
-// AVX2 Substring Matcher (For main search)
-int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
+__forceinline int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
     if (needle_len == 0) return 1;
     char first_char = tolower(needle[0]);
     __m256i vec_first = _mm256_set1_epi8(first_char);
     __m256i vec_case_mask = _mm256_set1_epi8(0x20);
     size_t i = 0;
+    
     for (; haystack[i]; i += 32) {
         __m256i block = _mm256_loadu_si256((const __m256i*)(haystack + i));
         __m256i block_lower = _mm256_or_si256(block, vec_case_mask);
@@ -123,15 +127,18 @@ int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len)
 }
 
 // ==========================================
-// HELPERS
+// STORAGE & BATCHING
 // ==========================================
-void add_result(const char *path, uint64_t size_bytes) {
+void add_results_batch(const char (*paths)[MAX_PATH_LEN], const uint64_t *sizes, int count) {
+    if (count == 0) return;
+
     EnterCriticalSection(&result_lock);
-    if (result_count >= result_capacity) {
-        long new_cap = result_capacity + (result_capacity / 2) + 1024;
+    
+    if (result_count + count >= result_capacity) {
+        long new_cap = result_capacity + count + (result_capacity / 2) + 1024;
         Result *new_ptr = (Result*)realloc(results, new_cap * sizeof(Result));
-        // Handle Aligned Realloc for sizes manually
         uint64_t *new_sizes = (uint64_t*)_aligned_malloc(new_cap * sizeof(uint64_t), 32);
+        
         if (new_ptr && new_sizes) {
             results = new_ptr;
             if (file_sizes) {
@@ -143,12 +150,16 @@ void add_result(const char *path, uint64_t size_bytes) {
         } else {
             if (new_sizes) _aligned_free(new_sizes);
             LeaveCriticalSection(&result_lock);
-            return; 
+            return;
         }
     }
-    strcpy(results[result_count].path, path);
-    file_sizes[result_count] = size_bytes; // Store in hot array
-    result_count++;
+
+    for(int i=0; i<count; i++) {
+        strcpy(results[result_count + i].path, paths[i]);
+    }
+    memcpy(&file_sizes[result_count], sizes, count * sizeof(uint64_t));
+    
+    result_count += count;
     LeaveCriticalSection(&result_lock);
 }
 
@@ -162,7 +173,7 @@ void join_path(char *dest, const char *p1, const char *p2) {
 }
 
 // ==========================================
-// FILTER LOGIC (UPDATED)
+// FILTER LOGIC
 // ==========================================
 void update_filter(int reset_selection) {
     EnterCriticalSection(&result_lock);
@@ -178,31 +189,56 @@ void update_filter(int reset_selection) {
 
     filtered_count = 0;
     int has_wildcard = (strchr(filter_text, '*') || strchr(filter_text, '?'));
+    size_t f_len = strlen(filter_text);
 
-    if (strlen(filter_text) == 0) {
-        for (long i = 0; i < result_count; i++) filtered_indices[i] = i;
+    if (f_len == 0) {
+        long i = 0;
+        for (; i <= result_count - 8; i += 8) {
+            filtered_indices[i] = i; filtered_indices[i+1] = i+1;
+            filtered_indices[i+2] = i+2; filtered_indices[i+3] = i+3;
+            filtered_indices[i+4] = i+4; filtered_indices[i+5] = i+5;
+            filtered_indices[i+6] = i+6; filtered_indices[i+7] = i+7;
+        }
+        for (; i < result_count; i++) filtered_indices[i] = i;
         filtered_count = result_count;
     } else {
-        for (long i = 0; i < result_count; i++) {
-            const char *search_haystack = results[i].path;
-            
-            // Filter Mode: 0=Name, 1=Path
+        long i = 0;
+        for (; i <= result_count - 4; i += 4) {
+            const char *s[4];
+            s[0] = results[i].path; s[1] = results[i+1].path;
+            s[2] = results[i+2].path; s[3] = results[i+3].path;
+
             if (filter_mode == 0) {
-                const char *last_slash = strrchr(search_haystack, '\\');
-                if (last_slash) search_haystack = last_slash + 1;
+                const char *ls;
+                ls = strrchr(s[0], '\\'); if(ls) s[0] = ls+1;
+                ls = strrchr(s[1], '\\'); if(ls) s[1] = ls+1;
+                ls = strrchr(s[2], '\\'); if(ls) s[2] = ls+1;
+                ls = strrchr(s[3], '\\'); if(ls) s[3] = ls+1;
             }
 
-            // Hybrid Matcher: Use Glob if wildcards exist, else Substring
-            int match = 0;
+            int m[4];
             if (has_wildcard) {
-                match = fast_glob_match(search_haystack, filter_text);
+                m[0] = fast_glob_match(s[0], filter_text); m[1] = fast_glob_match(s[1], filter_text);
+                m[2] = fast_glob_match(s[2], filter_text); m[3] = fast_glob_match(s[3], filter_text);
             } else {
-                match = (stristr(search_haystack, filter_text) != NULL);
+                m[0] = (stristr(s[0], filter_text) != NULL); m[1] = (stristr(s[1], filter_text) != NULL);
+                m[2] = (stristr(s[2], filter_text) != NULL); m[3] = (stristr(s[3], filter_text) != NULL);
             }
 
-            if (match) {
-                filtered_indices[filtered_count++] = i;
+            if (m[0]) filtered_indices[filtered_count++] = i;
+            if (m[1]) filtered_indices[filtered_count++] = i+1;
+            if (m[2]) filtered_indices[filtered_count++] = i+2;
+            if (m[3]) filtered_indices[filtered_count++] = i+3;
+        }
+
+        for (; i < result_count; i++) {
+            const char *s = results[i].path;
+            if (filter_mode == 0) {
+                const char *ls = strrchr(s, '\\');
+                if (ls) s = ls + 1;
             }
+            int match = has_wildcard ? fast_glob_match(s, filter_text) : (stristr(s, filter_text) != NULL);
+            if (match) filtered_indices[filtered_count++] = i;
         }
     }
     
@@ -210,7 +246,6 @@ void update_filter(int reset_selection) {
         selected_index = 0;
         scroll_offset = 0;
     } else {
-        // Clamp if filtered count shrank
         if (filtered_count > 0 && selected_index >= filtered_count) {
             selected_index = filtered_count - 1;
         }
@@ -230,6 +265,8 @@ typedef struct QueueNode {
 QueueNode *q_head = NULL;
 QueueNode *q_tail = NULL;
 CRITICAL_SECTION queue_lock;
+CONDITION_VARIABLE queue_cond;
+volatile long idle_workers = 0;
 
 void push_job(const char *path) {
     QueueNode *node = (QueueNode*)malloc(sizeof(QueueNode));
@@ -244,6 +281,7 @@ void push_job(const char *path) {
     } else {
         q_head = q_tail = node;
     }
+    WakeConditionVariable(&queue_cond);
     LeaveCriticalSection(&queue_lock);
 }
 
@@ -264,17 +302,13 @@ int pop_job(char *out_path) {
 }
 
 // ==========================================
-// ==========================================
 // AVX2 SIZE ESTIMATOR
 // ==========================================
-// Sums file sizes using AVX2.
-// If indices are provided (filtered view), uses Gather instructions.
-// If indices are NULL (all files), uses Linear loads (Maximum Bandwidth).
 unsigned long long calculate_total_size_avx2(uint64_t *sizes, long *indices, long count) {
     if (count == 0) return 0;
     __m256i v_sum = _mm256_setzero_si256();
     long i = 0;
-    // MODE 1: FILTERED GATHER (Indirect Addressing)
+    
     if (indices) {
         for (; i <= count - 8; i += 8) {
             __m256i v_idx_raw = _mm256_loadu_si256((__m256i const*)&indices[i]);
@@ -289,13 +323,9 @@ unsigned long long calculate_total_size_avx2(uint64_t *sizes, long *indices, lon
         uint64_t buffer[4];
         _mm256_storeu_si256((__m256i*)buffer, v_sum);
         total = buffer[0] + buffer[1] + buffer[2] + buffer[3];
-        for (; i < count; i++) {
-            total += sizes[indices[i]];
-        }
+        for (; i < count; i++) total += sizes[indices[i]];
         return total;
-    }
-    // MODE 2: LINEAR SCAN (Direct Addressing)
-    else {
+    } else {
         for (; i <= count - 16; i += 16) {
             __m256i v0 = _mm256_load_si256((__m256i const*)&sizes[i]);
             __m256i v1 = _mm256_load_si256((__m256i const*)&sizes[i+4]);
@@ -309,14 +339,11 @@ unsigned long long calculate_total_size_avx2(uint64_t *sizes, long *indices, lon
         uint64_t buffer[4];
         _mm256_storeu_si256((__m256i*)buffer, v_sum);
         total = buffer[0] + buffer[1] + buffer[2] + buffer[3];
-        for (; i < count; i++) {
-            total += sizes[i];
-        }
+        for (; i < count; i++) total += sizes[i];
         return total;
     }
 }
 
-// Branchless-ish formatting for sizes
 void format_size_fast(unsigned long long bytes, char *out) {
     const char *units[] = {"B", "KB", "MB", "GB", "TB"};
     int unit_idx = 0;
@@ -328,20 +355,81 @@ void format_size_fast(unsigned long long bytes, char *out) {
     snprintf(out, 32, "%.2f %s", size, units[unit_idx]);
 }
 
-// WORKER THREAD
+// ==========================================
+// WORKER THREAD (ADAPTIVE BATCHING)
 // ==========================================
 unsigned __stdcall worker_thread(void *arg) {
     char current_dir[MAX_PATH_LEN];
     char search_path[MAX_PATH_LEN];
-    char full_path[MAX_PATH_LEN];
+    
+    // THREAD LOCAL BATCH STORAGE
+    char (*batch_paths)[MAX_PATH_LEN] = malloc(WORKER_BATCH_SIZE * MAX_PATH_LEN);
+    uint64_t *batch_sizes = malloc(WORKER_BATCH_SIZE * sizeof(uint64_t));
+    int batch_count = 0;
+    
+    // ADAPTIVE BATCHING: Start at 1 for instant feedback, ramp to 64 for speed
+    int current_batch_limit = 1;
+
     WIN32_FIND_DATAA find_data;
     HANDLE hFind;
 
     InterlockedIncrement(&active_workers);
+
     while (running) {
-        if (pop_job(current_dir)) {
+        int has_work = 0;
+
+        // ----------------------------------------
+        // THE WAITING ROOM
+        // ----------------------------------------
+        EnterCriticalSection(&queue_lock);
+        while (q_head == NULL && running) {
+            if (batch_count > 0) {
+                LeaveCriticalSection(&queue_lock); 
+                add_results_batch(batch_paths, batch_sizes, batch_count);
+                batch_count = 0;
+                EnterCriticalSection(&queue_lock); 
+                continue; 
+            }
+
+            // If we sleep, reset batch limit to 1 for responsiveness on next wake
+            current_batch_limit = 1;
+
+            idle_workers++;
+            if (idle_workers == THREAD_COUNT) {
+                finished_scanning = 1;
+                WakeAllConditionVariable(&queue_cond);
+            }
+            if (finished_scanning) {
+                idle_workers--;
+                LeaveCriticalSection(&queue_lock);
+                if (batch_count > 0) add_results_batch(batch_paths, batch_sizes, batch_count);
+                free(batch_paths);
+                free(batch_sizes);
+                InterlockedDecrement(&active_workers);
+                return 0;
+            }
+            SleepConditionVariableCS(&queue_cond, &queue_lock, INFINITE);
+            idle_workers--;
+        }
+
+        if (q_head) {
+            QueueNode *node = q_head;
+            strcpy(current_dir, node->path);
+            q_head = node->next;
+            if (q_head == NULL) q_tail = NULL;
+            free(node->path);
+            free(node);
+            has_work = 1;
+        }
+        LeaveCriticalSection(&queue_lock);
+
+        // ----------------------------------------
+        // THE GRIND
+        // ----------------------------------------
+        if (has_work) {
             join_path(search_path, current_dir, "*");
             hFind = FindFirstFileExA(search_path, FindExInfoBasic, &find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+            
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
                     if (find_data.cFileName[0] == '.') {
@@ -354,10 +442,22 @@ unsigned __stdcall worker_thread(void *arg) {
                     else match = avx2_strcasestr(find_data.cFileName, TARGET_LOWER, TARGET_LEN);
 
                     if (match) {
-                        join_path(full_path, current_dir, find_data.cFileName);
-                        // Combine high and low DWORDs into 64-bit integer
-                        uint64_t fsize = ((uint64_t)find_data.nFileSizeHigh << 32) | find_data.nFileSizeLow;
-                        add_result(full_path, fsize);
+                        join_path(batch_paths[batch_count], current_dir, find_data.cFileName);
+                        batch_sizes[batch_count] = ((uint64_t)find_data.nFileSizeHigh << 32) | find_data.nFileSizeLow;
+                        batch_count++;
+
+                        // ADAPTIVE FLUSH TRIGGER
+                        if (batch_count >= current_batch_limit) {
+                            add_results_batch(batch_paths, batch_sizes, batch_count);
+                            batch_count = 0;
+                            
+                            // Ramp up: 1 -> 8 -> 64
+                            if (current_batch_limit < WORKER_BATCH_SIZE) {
+                                current_batch_limit *= 8;
+                                if (current_batch_limit > WORKER_BATCH_SIZE) 
+                                    current_batch_limit = WORKER_BATCH_SIZE;
+                            }
+                        }
                     }
                     
                     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -370,14 +470,12 @@ unsigned __stdcall worker_thread(void *arg) {
                 } while (FindNextFileA(hFind, &find_data) && running);
                 FindClose(hFind);
             }
-        } else {
-            EnterCriticalSection(&queue_lock);
-            int empty = (q_head == NULL);
-            LeaveCriticalSection(&queue_lock);
-            if (finished_scanning && empty) break;
-            SwitchToThread();
         }
     }
+    
+    if (batch_count > 0) add_results_batch(batch_paths, batch_sizes, batch_count);
+    free(batch_paths);
+    free(batch_sizes);
     InterlockedDecrement(&active_workers);
     return 0;
 }
@@ -407,20 +505,20 @@ void render_ui() {
         buf_size = needed_size;
     }
 
-    // Clear Background
     for (int i = 0; i < needed_size; i++) {
         buffer[i].Char.AsciiChar = ' ';
         buffer[i].Attributes = FOREGROUND_WHITE;
     }
 
-    // Header
     char header[512];
     long display_total = is_filtering ? filtered_count : result_count;
-    // Selected file size (only)
     unsigned long long selected_bytes = 0;
     int have_selected_size = 0;
+    
     EnterCriticalSection(&result_lock);
     long count = is_filtering ? filtered_count : result_count;
+    unsigned long long total_view_bytes = calculate_total_size_avx2(file_sizes, is_filtering ? filtered_indices : NULL, count);
+    
     if (count > 0 && selected_index >= 0 && selected_index < count) {
         long real_index_hdr = is_filtering ? filtered_indices[selected_index] : selected_index;
         if (file_sizes) { selected_bytes = file_sizes[real_index_hdr]; have_selected_size = 1; }
@@ -428,20 +526,20 @@ void render_ui() {
     LeaveCriticalSection(&result_lock);
 
     char sel_size_str[32] = "-";
-    if (have_selected_size) {
-        format_size_fast(selected_bytes, sel_size_str);
-    }
+    if (have_selected_size) format_size_fast(selected_bytes, sel_size_str);
+    
+    char total_size_str[32] = "0 B";
+    format_size_fast(total_view_bytes, total_size_str);
 
-    snprintf(header, 512, " blade %s (%s) :: Search: %s :: Found: %ld :: Selected: %s%s", 
-             VERSION, COMMIT_SHA, TARGET_RAW, display_total, sel_size_str,
-             finished_scanning ? "" : " (Scanning...)");
+    snprintf(header, 512, " blade %s :: Found: %ld (%s) :: Sel: %s :: %s", 
+             VERSION, display_total, total_size_str, sel_size_str,
+             finished_scanning ? "Ready" : "Scanning...");
     
     for (int i = 0; i < strlen(header) && i < console_width; i++) {
         buffer[i].Char.AsciiChar = header[i];
         buffer[i].Attributes = BACKGROUND_RED | FOREGROUND_INTENSITY | FOREGROUND_WHITE;
     }
 
-    // Filter Bar
     int list_start_y = 1;
     int list_height = console_height - 1;
     
@@ -462,7 +560,6 @@ void render_ui() {
         list_height--; 
     }
 
-    // List
     EnterCriticalSection(&result_lock);
     count = is_filtering ? filtered_count : result_count;
     
@@ -538,6 +635,7 @@ int main(int argc, char **argv) {
 
     InitializeCriticalSection(&queue_lock);
     InitializeCriticalSection(&result_lock);
+    InitializeConditionVariable(&queue_cond); 
 
     hConsoleOut = GetStdHandle(STD_OUTPUT_HANDLE);
     hConsoleIn = GetStdHandle(STD_INPUT_HANDLE);
@@ -552,22 +650,13 @@ int main(int argc, char **argv) {
     console_width = csbi.srWindow.Right - csbi.srWindow.Left + 1;
     console_height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
 
-    // ==========================================
-    // PATH RESOLUTION (FIXED)
-    // ==========================================
     char start_dir[MAX_PATH_LEN];
     char *file_part;
-    
-    // Convert to absolute path immediately
     DWORD result_len = GetFullPathNameA(argv[1], MAX_PATH_LEN, start_dir, &file_part);
-    if (result_len == 0) {
-        strcpy(start_dir, argv[1]);
-    } else {
-        // Normalize trailing slash logic for directories vs root
+    if (result_len == 0) strcpy(start_dir, argv[1]);
+    else {
         size_t len = strlen(start_dir);
-        if (len > 3 && start_dir[len - 1] == '\\') {
-            start_dir[len - 1] = '\0';
-        }
+        if (len > 3 && start_dir[len - 1] == '\\') start_dir[len - 1] = '\0';
     }
 
     push_job(start_dir);
@@ -581,14 +670,7 @@ int main(int argc, char **argv) {
     DWORD recordsRead;
 
     while (running) {
-        EnterCriticalSection(&queue_lock);
-        int empty = (q_head == NULL);
-        LeaveCriticalSection(&queue_lock);
-
-        if (active_workers == 0 && empty) finished_scanning = 1;
-        else finished_scanning = 0;
-        
-        if (is_filtering && !finished_scanning) update_filter(0); // 0 = Don't reset selection
+        if (is_filtering && !finished_scanning) update_filter(0);
 
         DWORD events = 0;
         GetNumberOfConsoleInputEvents(hConsoleIn, &events);
@@ -601,10 +683,9 @@ int main(int argc, char **argv) {
                     char ascii = ir[i].Event.KeyEvent.uChar.AsciiChar;
                     DWORD ctrl = ir[i].Event.KeyEvent.dwControlKeyState;
 
-                    // 1. Global Hotkeys
                     if (vk == 'F' && (ctrl & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))) {
                         is_filtering = !is_filtering;
-                        if (is_filtering) update_filter(1); // Reset selection on open
+                        if (is_filtering) update_filter(1);
                         continue;
                     }
                     if (vk == VK_ESCAPE) {
@@ -622,48 +703,22 @@ int main(int argc, char **argv) {
                         continue;
                     }
 
-                    // 2. Navigation (Always Active)
                     long max_items = is_filtering ? filtered_count : result_count;
                     
-                    if (vk == VK_UP && selected_index > 0) {
-                        selected_index--;
-                        continue;
-                    }
-                    if (vk == VK_DOWN && selected_index < max_items - 1) {
-                        selected_index++;
-                        continue;
-                    }
-                    if (vk == VK_PRIOR) { // Page Up
-                        selected_index -= 10;
-                        if (selected_index < 0) selected_index = 0;
-                        continue;
-                    }
-                    if (vk == VK_NEXT) { // Page Down
-                        selected_index += 10;
-                        if (selected_index >= max_items) selected_index = max_items - 1;
-                        continue;
-                    }
+                    if (vk == VK_UP && selected_index > 0) { selected_index--; continue; }
+                    if (vk == VK_DOWN && selected_index < max_items - 1) { selected_index++; continue; }
+                    if (vk == VK_PRIOR) { selected_index -= 10; if (selected_index < 0) selected_index = 0; continue; }
+                    if (vk == VK_NEXT) { selected_index += 10; if (selected_index >= max_items) selected_index = max_items - 1; continue; }
 
-                    // 3. Filter Text Input (Only if filtering)
                     if (is_filtering) {
-                        if (vk == VK_TAB) {
-                            filter_mode = !filter_mode; 
-                            update_filter(1);
-                        }
+                        if (vk == VK_TAB) { filter_mode = !filter_mode; update_filter(1); }
                         else if (vk == VK_BACK) {
                             size_t len = strlen(filter_text);
-                            if (len > 0) {
-                                filter_text[len - 1] = '\0';
-                                update_filter(1);
-                            }
+                            if (len > 0) { filter_text[len - 1] = '\0'; update_filter(1); }
                         }
                         else if (isprint((unsigned char)ascii)) {
                             size_t len = strlen(filter_text);
-                            if (len < 255) {
-                                filter_text[len] = ascii;
-                                filter_text[len + 1] = '\0';
-                                update_filter(1);
-                            }
+                            if (len < 255) { filter_text[len] = ascii; filter_text[len + 1] = '\0'; update_filter(1); }
                         }
                     }
                 }
