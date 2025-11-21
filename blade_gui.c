@@ -1,63 +1,183 @@
+// Force Windows Vista+ API
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <shellapi.h>
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <immintrin.h>
-#include <shlobj.h> // REQUIRED FOR FOLDER PICKER
+#include <immintrin.h> // AVX2
 
 // ==========================================
 // CONFIGURATION
 // ==========================================
-#define MAX_PATH_LEN 4096
+#define MAX_RESULTS 200000
+#define INITIAL_CAPACITY 16384
 #define THREAD_COUNT 16
-#define INITIAL_CAPACITY 65536
 #define FONT_NAME "Segoe UI"
-#define FONT_SIZE 18 
-#define BG_COLOR RGB(20, 20, 20)
-#define FG_COLOR RGB(220, 220, 220)
-#define ACCENT_COLOR RGB(0, 120, 215)
-#define SELECTED_TEXT_COLOR RGB(255, 255, 255)
-#define HEADER_HEIGHT 60 // Increased to fit Path info
+#define FONT_SIZE 20
+#define ROW_HEIGHT 28
+#define HEADER_HEIGHT 60
+
+// Theme: "Void"
+#define COL_BG       RGB(10, 10, 10)
+#define COL_HEADER   RGB(20, 20, 20)
+#define COL_TEXT     RGB(220, 220, 220)
+#define COL_DIR      RGB(255, 215, 0)
+#define COL_ACCENT   RGB(0, 120, 215)
+#define COL_SEL_TEXT RGB(255, 255, 255)
 
 // ==========================================
-// GLOBAL STATE
+// DATA STRUCTURES
 // ==========================================
-typedef struct { char path[MAX_PATH_LEN]; } Result;
+typedef struct {
+    char *path; // Dynamic string
+    int is_dir;
+    unsigned long long size;
+} Entry;
 
-Result *results = NULL;
-volatile long result_count = 0;
-long result_capacity = 0;
-CRITICAL_SECTION result_lock;
+// Global Storage
+Entry *entries = NULL;
+volatile long entry_count = 0;
+long entry_capacity = 0;
+CRITICAL_SECTION data_lock;
 
+// App State
 volatile int running = 1;
 volatile long active_workers = 0;
-volatile long search_generation = 0; 
+volatile long search_generation = 0;
 
-char root_directory[MAX_PATH_LEN];
-char search_term[256] = {0};
-char search_term_lower[256] = {0};
+char root_path[4096] = {0}; // Current root
+char search_buffer[256] = {0};
+char search_lower[256] = {0};
+size_t search_len = 0;
 int is_wildcard = 0;
 
+// UI State
 HWND hMainWnd;
 int selected_index = 0;
 int scroll_offset = 0;
-int window_width = 800;
-int window_height = 600;
+int window_width = 1024;
+int window_height = 768;
 int max_visible_items = 0;
-HFONT hFont;
-HFONT hFontSmall; // New smaller font for path display
 
+// GDI Resources
 HDC hdcBack = NULL;
 HBITMAP hbmBack = NULL;
 HBITMAP hbmOld = NULL;
+HFONT hFont = NULL;
+HFONT hFontSmall = NULL;
 
 // ==========================================
-// SEARCH LOGIC (AVX2 + GLOB)
+// UTILS & MEMORY
+// ==========================================
+static char* dup_str(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *p = (char*)malloc(len);
+    if (p) memcpy(p, s, len);
+    return p;
+}
+
+void clear_data() {
+    EnterCriticalSection(&data_lock);
+    for (long i = 0; i < entry_count; ++i) {
+        if (entries[i].path) free(entries[i].path);
+    }
+    entry_count = 0;
+    selected_index = 0;
+    scroll_offset = 0;
+    LeaveCriticalSection(&data_lock);
+}
+
+void add_entry(const char *full, int dir, unsigned long long sz) {
+    if (entry_count >= MAX_RESULTS) return;
+
+    EnterCriticalSection(&data_lock);
+    
+    if (entry_count >= entry_capacity) {
+        long new_cap = entry_capacity ? entry_capacity + (entry_capacity / 2) : INITIAL_CAPACITY;
+        Entry *new_ptr = (Entry*)realloc(entries, new_cap * sizeof(Entry));
+        if (!new_ptr) {
+            LeaveCriticalSection(&data_lock);
+            return;
+        }
+        entries = new_ptr;
+        entry_capacity = new_cap;
+    }
+
+    if (entry_count < entry_capacity) {
+        Entry *e = &entries[entry_count];
+        e->path = dup_str(full);
+        if (e->path) {
+            e->is_dir = dir;
+            e->size = sz;
+            entry_count++;
+        }
+    }
+    LeaveCriticalSection(&data_lock);
+}
+
+// Safe display name derivation (Fixes C:\ issue)
+static const char* get_display_name(const char *path) {
+    const char *slash = strrchr(path, '\\');
+    if (slash && slash[1] != '\0') return slash + 1;
+    return path;
+}
+
+// ==========================================
+// EXPLORER BRIDGES
+// ==========================================
+void open_in_explorer(const Entry *e) {
+    if (!e || !e->path) return;
+    char full[4096];
+    char *file_part = NULL;
+    if (!GetFullPathNameA(e->path, sizeof(full), full, &file_part)) strcpy(full, e->path);
+
+    char args[8192];
+    snprintf(args, sizeof(args), "/select,\"%s\"", full);
+    ShellExecuteA(NULL, "open", "explorer.exe", args, NULL, SW_SHOWNORMAL);
+}
+
+void copy_path_to_clipboard(const char *path) {
+    if (!path || !*path) return;
+    if (!OpenClipboard(hMainWnd)) return;
+    EmptyClipboard();
+    size_t len = strlen(path) + 1;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (hMem) {
+        char *dst = (char*)GlobalLock(hMem);
+        memcpy(dst, path, len);
+        GlobalUnlock(hMem);
+        SetClipboardData(CF_TEXT, hMem);
+    }
+    CloseClipboard();
+}
+
+// ==========================================
+// SORTING
+// ==========================================
+int __cdecl entry_cmp(const void *pa, const void *pb) {
+    const Entry *a = (const Entry*)pa;
+    const Entry *b = (const Entry*)pb;
+
+    int dirA = a->is_dir != 0;
+    int dirB = b->is_dir != 0;
+    if (dirA != dirB) return dirB - dirA; // directories first
+
+    const char *nameA = get_display_name(a->path);
+    const char *nameB = get_display_name(b->path);
+    return _stricmp(nameA, nameB);
+}
+
+// ==========================================
+// AVX2 SEARCH ENGINE
 // ==========================================
 int fast_glob_match(const char *text, const char *pattern) {
     while (*pattern) {
@@ -79,12 +199,13 @@ int fast_glob_match(const char *text, const char *pattern) {
     return !*text;
 }
 
-int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
+__forceinline int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len) {
     if (needle_len == 0) return 1;
     char first_char = tolower(needle[0]);
     __m256i vec_first = _mm256_set1_epi8(first_char);
     __m256i vec_case_mask = _mm256_set1_epi8(0x20);
-    for (size_t i = 0; haystack[i]; i += 32) {
+    size_t i = 0;
+    for (; haystack[i]; i += 32) {
         __m256i block = _mm256_loadu_si256((const __m256i*)(haystack + i));
         __m256i block_lower = _mm256_or_si256(block, vec_case_mask);
         __m256i eq = _mm256_cmpeq_epi8(vec_first, block_lower);
@@ -99,142 +220,154 @@ int avx2_strcasestr(const char *haystack, const char *needle, size_t needle_len)
 }
 
 // ==========================================
-// WORKER & DATA MANAGEMENT
+// FILE SYSTEM LOGIC
 // ==========================================
-void reset_search() {
-    EnterCriticalSection(&result_lock);
-    result_count = 0;
-    selected_index = 0;
-    scroll_offset = 0;
-    InterlockedIncrement(&search_generation);
-    LeaveCriticalSection(&result_lock);
+void list_directory(const char *path) {
+    clear_data();
+    char search_spec[4096];
+    snprintf(search_spec, 4096, "%s\\*", path);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileExA(search_spec, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == '.') continue;
+            char full[4096];
+            snprintf(full, 4096, "%s\\%s", path, fd.cFileName);
+            unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            add_entry(full, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY), sz);
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // Optimized QSort
+    EnterCriticalSection(&data_lock);
+    if (entry_count > 1) qsort(entries, entry_count, sizeof(Entry), entry_cmp);
+    LeaveCriticalSection(&data_lock);
     InvalidateRect(hMainWnd, NULL, FALSE);
 }
 
-void add_result(const char *path) {
-    EnterCriticalSection(&result_lock);
-    if (result_count >= result_capacity) {
-        long new_cap = result_capacity + (result_capacity / 2);
-        Result *new_ptr = (Result*)realloc(results, new_cap * sizeof(Result));
-        if (new_ptr) { results = new_ptr; result_capacity = new_cap; }
+void list_drives() {
+    clear_data();
+    DWORD drives = GetLogicalDrives();
+    char d[] = "A:\\";
+    for (int i = 0; i < 26; i++) {
+        if (drives & (1 << i)) {
+            d[0] = 'A' + i;
+            add_entry(d, 1, 0);
+        }
     }
-    if (result_count < result_capacity) {
-        strcpy(results[result_count].path, path);
-        result_count++;
-    }
-    if (result_count < 50 || result_count % 100 == 0) {
-        InvalidateRect(hMainWnd, NULL, FALSE);
-    }
-    LeaveCriticalSection(&result_lock);
+    InvalidateRect(hMainWnd, NULL, FALSE);
 }
 
-void scan_dir(char *path, long my_gen) {
-    if (my_gen != search_generation || !running) return;
+void scan_recursive(char *path, long gen) {
+    if (gen != search_generation || !running) return;
 
-    char search_path[MAX_PATH_LEN];
-    WIN32_FIND_DATAA find_data;
-    sprintf(search_path, "%s\\*", path);
-
-    HANDLE hFind = FindFirstFileExA(search_path, FindExInfoBasic, &find_data, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    char spec[4096];
+    snprintf(spec, 4096, "%s\\*", path);
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileExA(spec, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    
     if (hFind == INVALID_HANDLE_VALUE) return;
 
     do {
-        if (my_gen != search_generation) break;
-        if (find_data.cFileName[0] == '.') continue;
+        if (gen != search_generation) break;
+        if (fd.cFileName[0] == '.') continue;
 
         int match = 0;
-        if (is_wildcard) match = fast_glob_match(find_data.cFileName, search_term);
-        else match = avx2_strcasestr(find_data.cFileName, search_term_lower, strlen(search_term));
+        if (is_wildcard) match = fast_glob_match(fd.cFileName, search_buffer);
+        else match = avx2_strcasestr(fd.cFileName, search_lower, search_len);
+
+        char full[4096];
+        snprintf(full, 4096, "%s\\%s", path, fd.cFileName);
+        int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
 
         if (match) {
-            char full_path[MAX_PATH_LEN];
-            snprintf(full_path, MAX_PATH_LEN, "%s\\%s", path, find_data.cFileName);
-            add_result(full_path);
+            unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            add_entry(full, is_dir, sz);
         }
 
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            char sub_path[MAX_PATH_LEN];
-            snprintf(sub_path, MAX_PATH_LEN, "%s\\%s", path, find_data.cFileName);
-            scan_dir(sub_path, my_gen);
+        if (is_dir && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            scan_recursive(full, gen);
         }
-    } while (FindNextFileA(hFind, &find_data));
+    } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
 }
 
-unsigned __stdcall worker_thread(void *arg) {
-    long my_gen = (long)(intptr_t)arg;
+unsigned __stdcall hunter_thread(void *arg) {
+    long gen = (long)(intptr_t)arg;
     InterlockedIncrement(&active_workers);
-    scan_dir(root_directory, my_gen);
+    if (strlen(root_path) == 0) {
+        DWORD drives = GetLogicalDrives();
+        char d[] = "A:\\";
+        for (int i = 0; i < 26; i++) {
+            if (gen != search_generation) break;
+            if (drives & (1 << i)) {
+                d[0] = 'A' + i;
+                scan_recursive(d, gen);
+            }
+        }
+    } else {
+        scan_recursive(root_path, gen);
+    }
     InterlockedDecrement(&active_workers);
     InvalidateRect(hMainWnd, NULL, FALSE);
     return 0;
 }
 
-void start_search_thread() {
-    _beginthreadex(NULL, 0, worker_thread, (void*)(intptr_t)search_generation, 0, NULL);
-}
-
 // ==========================================
-// FOLDER PICKER 
+// NAVIGATION
 // ==========================================
-
-// Keep the callback to handle the default selection
-int CALLBACK BrowseCallbackProc(HWND hwnd, UINT uMsg, LPARAM lParam, LPARAM lpData) {
-    if (uMsg == BFFM_INITIALIZED) {
-        // Select the current directory if it exists
-        SendMessageA(hwnd, BFFM_SETSELECTIONA, (WPARAM)TRUE, (LPARAM)lpData);
-    }
-    return 0;
-}
-
-void select_root_folder() {
-    char buffer[MAX_PATH];
-    BROWSEINFOA bi = { 0 };
-    LPITEMIDLIST pidlMyComputer = NULL;
-    IMalloc *imalloc = 0;
-
-    // 1. Get the Memory Allocator (Standard COM way to free shell memory)
-    if (FAILED(SHGetMalloc(&imalloc))) return;
-
-    // 2. Get the PIDL for "This PC" (CSIDL_DRIVES)
-    // This tells the dialog to start the tree at "My Computer" level
-    if (SUCCEEDED(SHGetSpecialFolderLocation(hMainWnd, CSIDL_DRIVES, &pidlMyComputer))) {
-        bi.pidlRoot = pidlMyComputer;
-    }
-
-    bi.hwndOwner = hMainWnd;
-    bi.lpszTitle = "Select Search Directory";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI | BIF_NONEWFOLDERBUTTON;
-    bi.lpfn = BrowseCallbackProc;
-    bi.lParam = (LPARAM)root_directory; // Pre-select current folder
-
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    
-    if (pidl != 0) {
-        if (SHGetPathFromIDListA(pidl, buffer)) {
-            strcpy(root_directory, buffer);
-            
-            // Formatting: Remove trailing slash unless it's root (e.g. "C:\" is fine, "C:\Users\" -> "C:\Users")
-            size_t len = strlen(root_directory);
-            if (len > 3 && root_directory[len-1] == '\\') root_directory[len-1] = 0;
-
-            reset_search();
-            if (strlen(search_term) > 0) start_search_thread();
+void refresh_state() {
+    InterlockedIncrement(&search_generation);
+    if (strlen(search_buffer) == 0) {
+        if (strlen(root_path) == 0) list_drives();
+        else list_directory(root_path);
+    } else {
+        clear_data();
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            _beginthreadex(NULL, 0, hunter_thread, (void*)(intptr_t)search_generation, 0, NULL);
         }
-        imalloc->lpVtbl->Free(imalloc, pidl);
     }
+    InvalidateRect(hMainWnd, NULL, FALSE);
+}
 
-    // 3. Clean up the "This PC" PIDL
-    if (pidlMyComputer) {
-        imalloc->lpVtbl->Free(imalloc, pidlMyComputer);
-    }
-    imalloc->lpVtbl->Release(imalloc);
+void navigate_up() {
+    if (strlen(root_path) == 0) return;
+    char *last = strrchr(root_path, '\\');
+    if (last) {
+        if (last == strchr(root_path, '\\') && root_path[strlen(root_path)-1] == '\\') root_path[0] = 0;
+        else {
+            *last = 0;
+            if (strlen(root_path) == 2 && root_path[1] == ':') strcat(root_path, "\\");
+        }
+    } else root_path[0] = 0;
+    
+    search_buffer[0] = 0;
+    refresh_state();
+}
+
+void navigate_down() {
+    EnterCriticalSection(&data_lock);
+    if (entry_count > 0 && selected_index < entry_count) {
+        Entry *e = &entries[selected_index];
+        if (e->is_dir) {
+            strcpy(root_path, e->path);
+            search_buffer[0] = 0;
+            LeaveCriticalSection(&data_lock);
+            refresh_state();
+        } else {
+            ShellExecuteA(NULL, "open", e->path, NULL, NULL, SW_SHOWDEFAULT);
+            LeaveCriticalSection(&data_lock);
+        }
+    } else LeaveCriticalSection(&data_lock);
 }
 
 // ==========================================
-// GRAPHICS
+// RENDERING
 // ==========================================
-void InitDoubleBuffering(HDC hdc, int w, int h) {
+void InitDoubleBuffer(HDC hdc, int w, int h) {
     if (hdcBack) DeleteDC(hdcBack);
     if (hbmBack) DeleteObject(hbmBack);
     hdcBack = CreateCompatibleDC(hdc);
@@ -242,94 +375,108 @@ void InitDoubleBuffering(HDC hdc, int w, int h) {
     hbmOld = (HBITMAP)SelectObject(hdcBack, hbmBack);
 }
 
+void format_size(unsigned long long bytes, char *out) {
+    if (bytes == 0) { strcpy(out, ""); return; }
+    const char *u[] = {"B", "KB", "MB", "GB"};
+    int i = 0;
+    double d = (double)bytes;
+    while (d > 1024 && i < 3) { d /= 1024; i++; }
+    sprintf(out, "%.1f %s", d, u[i]);
+}
+
 void Render(HDC hdcDest) {
     if (!hdcBack) return;
 
-    // 1. Clear Background
     RECT rc = {0, 0, window_width, window_height};
-    HBRUSH bgBrush = CreateSolidBrush(BG_COLOR);
-    FillRect(hdcBack, &rc, bgBrush);
-    DeleteObject(bgBrush);
+    HBRUSH hBg = CreateSolidBrush(COL_BG);
+    FillRect(hdcBack, &rc, hBg);
+    DeleteObject(hBg);
 
-    // 2. Draw Header
-    RECT rcHeader = {0, 0, window_width, HEADER_HEIGHT};
-    HBRUSH headerBrush = CreateSolidBrush(RGB(35, 35, 35));
-    FillRect(hdcBack, &rcHeader, headerBrush);
-    DeleteObject(headerBrush);
+    RECT rcHead = {0, 0, window_width, HEADER_HEIGHT};
+    HBRUSH hHeader = CreateSolidBrush(COL_HEADER);
+    FillRect(hdcBack, &rcHead, hHeader);
+    DeleteObject(hHeader);
 
     SetBkMode(hdcBack, TRANSPARENT);
-    
-    // Line 1: Search Term
-    SelectObject(hdcBack, hFont);
-    SetTextColor(hdcBack, FG_COLOR);
-    TextOutA(hdcBack, 10, 5, search_term, strlen(search_term));
-    
-    // Cursor
-    SIZE sz;
-    GetTextExtentPoint32A(hdcBack, search_term, strlen(search_term), &sz);
-    TextOutA(hdcBack, 10 + sz.cx, 5, "_", 1);
 
-    // Line 2: Current Path (Small Text)
+    // Header Text
+    SelectObject(hdcBack, hFont);
+    SetTextColor(hdcBack, COL_ACCENT);
+    TextOutA(hdcBack, 10, 5, strlen(root_path) ? root_path : "This PC", strlen(root_path) ? strlen(root_path) : 7);
+
+    // Search Prompt
+    SetTextColor(hdcBack, COL_TEXT);
+    char prompt[300];
+    if (strlen(search_buffer) > 0) snprintf(prompt, 300, "Finding: %s_", search_buffer);
+    else strcpy(prompt, "Type to hunt files...");
     SelectObject(hdcBack, hFontSmall);
-    SetTextColor(hdcBack, RGB(150, 150, 150));
-    char path_display[MAX_PATH_LEN + 32];
-    snprintf(path_display, sizeof(path_display), "Searching in: %s (Ctrl+O to change)", root_directory);
-    TextOutA(hdcBack, 10, 32, path_display, strlen(path_display));
+    TextOutA(hdcBack, 10, 35, prompt, strlen(prompt));
 
-    // Status (Right Aligned)
+    // Stats
+    char stats[64];
+    snprintf(stats, 64, "%ld items %s", entry_count, active_workers > 0 ? "[BUSY]" : "");
+    SIZE sz; GetTextExtentPoint32A(hdcBack, stats, strlen(stats), &sz);
+    TextOutA(hdcBack, window_width - sz.cx - 10, 10, stats, strlen(stats));
+
+    // List
+    EnterCriticalSection(&data_lock);
+    int start_y = HEADER_HEIGHT + 5;
+    max_visible_items = (window_height - start_y) / ROW_HEIGHT;
+
+    if (selected_index >= entry_count) selected_index = entry_count - 1;
+    if (selected_index < 0) selected_index = 0;
+    if (selected_index < scroll_offset) scroll_offset = selected_index;
+    if (selected_index >= scroll_offset + max_visible_items) scroll_offset = selected_index - max_visible_items + 1;
+
     SelectObject(hdcBack, hFont);
-    char status[128];
-    snprintf(status, 128, "%ld hits %s", result_count, active_workers > 0 ? "(Scanning)" : "");
-    SIZE szStatus;
-    GetTextExtentPoint32A(hdcBack, status, strlen(status), &szStatus);
-    SetTextColor(hdcBack, RGB(100, 100, 100));
-    TextOutA(hdcBack, window_width - szStatus.cx - 10, 10, status, strlen(status));
-
-    // 3. Draw List
-    int item_h = FONT_SIZE + 10;
-    int start_y = HEADER_HEIGHT;
-    max_visible_items = (window_height - HEADER_HEIGHT) / item_h;
-
-    EnterCriticalSection(&result_lock);
-    if (scroll_offset > result_count - max_visible_items) scroll_offset = result_count - max_visible_items;
-    if (scroll_offset < 0) scroll_offset = 0;
-
-    SelectObject(hdcBack, hFont); // Back to main font
-    
     for (int i = 0; i < max_visible_items; i++) {
         int idx = scroll_offset + i;
-        if (idx >= result_count) break;
+        if (idx >= entry_count) break;
+        
+        int y = start_y + (i * ROW_HEIGHT);
+        Entry *e = &entries[idx];
+        
+        // FIX: Use safe display name helper
+        const char *disp = get_display_name(e->path);
 
-        int y = start_y + (i * item_h);
-        RECT rcItem = {0, y, window_width, y + item_h};
-
+        // Highlight
         if (idx == selected_index) {
-            HBRUSH selBrush = CreateSolidBrush(ACCENT_COLOR);
-            FillRect(hdcBack, &rcItem, selBrush);
-            DeleteObject(selBrush);
-            SetTextColor(hdcBack, SELECTED_TEXT_COLOR);
+            RECT rcRow = {10, y, window_width - 10, y + ROW_HEIGHT};
+            HBRUSH hSel = CreateSolidBrush(COL_ACCENT);
+            FillRect(hdcBack, &rcRow, hSel);
+            DeleteObject(hSel);
+            SetTextColor(hdcBack, COL_SEL_TEXT);
         } else {
-            SetTextColor(hdcBack, FG_COLOR);
+            SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
         }
-        TextOutA(hdcBack, 10, y + 5, results[idx].path, strlen(results[idx].path));
+
+        TextOutA(hdcBack, 15, y, disp, strlen(disp));
+
+        if (!e->is_dir) {
+            char sz[32]; format_size(e->size, sz);
+            SIZE ssz; GetTextExtentPoint32A(hdcBack, sz, strlen(sz), &ssz);
+            TextOutA(hdcBack, window_width - ssz.cx - 15, y, sz, strlen(sz));
+        }
     }
-    LeaveCriticalSection(&result_lock);
+    LeaveCriticalSection(&data_lock);
 
     BitBlt(hdcDest, 0, 0, window_width, window_height, hdcBack, 0, 0, SRCCOPY);
 }
 
 // ==========================================
-// WINDOW PROCEDURE
+// WINDOW PROC
 // ==========================================
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
         case WM_CREATE:
-            hFont = CreateFontA(FONT_SIZE, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
-                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
-                               CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
-            hFontSmall = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
-                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
-                               CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            hFont = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            hFontSmall = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            refresh_state();
+            SetTimer(hwnd, 1, 100, NULL);
+            return 0;
+
+        case WM_TIMER:
+            if (active_workers > 0) InvalidateRect(hwnd, NULL, FALSE);
             return 0;
 
         case WM_SIZE:
@@ -337,12 +484,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             window_height = HIWORD(lParam);
             {
                 HDC hdc = GetDC(hwnd);
-                InitDoubleBuffering(hdc, window_width, window_height);
+                InitDoubleBuffer(hdc, window_width, window_height);
                 ReleaseDC(hwnd, hdc);
             }
             break;
 
-        case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -351,100 +497,128 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        case WM_CHAR: {
-            if (wParam == VK_ESCAPE) { PostQuitMessage(0); return 0; }
-            // Handle Ctrl+O here if it comes through as char 15, OR rely on KeyDown
-            // Usually safest to do text input here
-            if (wParam == VK_BACK) {
-                int len = strlen(search_term);
-                if (len > 0) search_term[len - 1] = 0;
-            } else if (wParam >= 32 && wParam <= 126) {
-                int len = strlen(search_term);
-                if (len < 255) {
-                    search_term[len] = (char)wParam;
-                    search_term[len+1] = 0;
+        case WM_MOUSEWHEEL:
+            if ((short)HIWORD(wParam) > 0) scroll_offset -= 3;
+            else scroll_offset += 3;
+            if (scroll_offset < 0) scroll_offset = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+
+        case WM_CHAR:
+            if (wParam == VK_ESCAPE) {
+                if (strlen(search_buffer) > 0) { search_buffer[0] = 0; refresh_state(); }
+                else PostQuitMessage(0);
+            } else if (wParam == VK_BACK) {
+                size_t len = strlen(search_buffer);
+                if (len > 0) {
+                    search_buffer[len-1] = 0;
+                    search_len = len - 1;
+                    for(int i=0; i<256; i++) search_lower[i] = tolower(search_buffer[i]);
+                    refresh_state();
+                } else navigate_up();
+            } else if (wParam >= 32 && wParam < 127) {
+                size_t len = strlen(search_buffer);
+                if (len < 250) {
+                    search_buffer[len] = (char)wParam;
+                    search_buffer[len+1] = 0;
+                    search_len = len + 1;
+                    is_wildcard = (strchr(search_buffer, '*') || strchr(search_buffer, '?'));
+                    for(int i=0; i<256; i++) search_lower[i] = tolower(search_buffer[i]);
+                    refresh_state();
                 }
-            } else {
-                return 0; 
             }
+            return 0;
 
-            is_wildcard = (strchr(search_term, '*') || strchr(search_term, '?'));
-            for(int i=0; search_term[i]; i++) search_term_lower[i] = tolower(search_term[i]);
-            search_term_lower[strlen(search_term)] = 0;
+        case WM_KEYDOWN:
+            switch(wParam) {
+                case VK_UP: if(selected_index > 0) selected_index--; break;
+                case VK_DOWN: selected_index++; break;
+                case VK_PRIOR: selected_index -= max_visible_items; break;
+                case VK_NEXT: selected_index += max_visible_items; break;
+                
+                case VK_RETURN: {
+                    SHORT ctrl = GetKeyState(VK_CONTROL);
+                    // Ctrl+Enter: Open /select
+                    if (ctrl & 0x8000) {
+                         EnterCriticalSection(&data_lock);
+                         if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) 
+                            open_in_explorer(&entries[selected_index]);
+                         LeaveCriticalSection(&data_lock);
+                         break;
+                    }
+                    // Path input navigation
+                    if (search_buffer[0]) {
+                         char cand[4096];
+                         if ((search_buffer[1] == ':' && (search_buffer[2] == '\\' || search_buffer[2] == '/')) || search_buffer[0] == '\\') {
+                             strcpy(cand, search_buffer);
+                         } else if (root_path[0]) {
+                             snprintf(cand, 4096, "%s\\%s", root_path, search_buffer);
+                         } else strcpy(cand, search_buffer);
 
-            reset_search();
-            if (strlen(search_term) > 0) start_search_thread();
+                         DWORD attrs = GetFileAttributesA(cand);
+                         if (attrs != INVALID_FILE_ATTRIBUTES) {
+                             if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+                                 strcpy(root_path, cand);
+                                 search_buffer[0] = 0;
+                                 refresh_state();
+                             } else ShellExecuteA(NULL, "open", cand, NULL, NULL, SW_SHOWDEFAULT);
+                             break;
+                         }
+                    }
+                    navigate_down();
+                    break;
+                }
+
+                case 'C': {
+                    SHORT ctrl = GetKeyState(VK_CONTROL);
+                    SHORT shift = GetKeyState(VK_SHIFT);
+                    if ((ctrl & 0x8000) && (shift & 0x8000)) { // Ctrl+Shift+C
+                        EnterCriticalSection(&data_lock);
+                        if (entry_count > 0 && selected_index < entry_count)
+                            copy_path_to_clipboard(entries[selected_index].path);
+                        LeaveCriticalSection(&data_lock);
+                    }
+                    break;
+                }
+            }
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
-        }
-
-        case WM_KEYDOWN: {
-            // HOTKEY: Ctrl + O (Open Folder)
-            if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                select_root_folder();
-                return 0;
-            }
-
-            EnterCriticalSection(&result_lock);
-            if (wParam == VK_DOWN) {
-                if (selected_index < result_count - 1) selected_index++;
-                if (selected_index >= scroll_offset + max_visible_items) scroll_offset++;
-            }
-            else if (wParam == VK_UP) {
-                if (selected_index > 0) selected_index--;
-                if (selected_index < scroll_offset) scroll_offset--;
-            }
-            else if (wParam == VK_PRIOR) { 
-                selected_index -= max_visible_items;
-                scroll_offset -= max_visible_items;
-                if (selected_index < 0) selected_index = 0;
-                if (scroll_offset < 0) scroll_offset = 0;
-            }
-            else if (wParam == VK_NEXT) { 
-                selected_index += max_visible_items;
-                scroll_offset += max_visible_items;
-                if (selected_index >= result_count) selected_index = result_count - 1;
-                if (scroll_offset > result_count - max_visible_items) scroll_offset = result_count - max_visible_items;
-            }
-            else if (wParam == VK_RETURN && result_count > 0) {
-                char param[MAX_PATH_LEN + 32];
-                snprintf(param, sizeof(param), "/select,\"%s\"", results[selected_index].path);
-                ShellExecuteA(NULL, "open", "explorer.exe", param, NULL, SW_SHOWDEFAULT);
-            }
-            LeaveCriticalSection(&result_lock);
-            InvalidateRect(hwnd, NULL, FALSE);
-            return 0;
-        }
 
         case WM_DESTROY:
+            running = 0;
+            KillTimer(hwnd, 1);
+            if (hdcBack) {
+                SelectObject(hdcBack, hbmOld);
+                DeleteObject(hbmBack);
+                DeleteDC(hdcBack);
+            }
+            if (hFont) DeleteObject(hFont);
+            if (hFontSmall) DeleteObject(hFontSmall);
+            clear_data();
+            free(entries);
+            DeleteCriticalSection(&data_lock);
             PostQuitMessage(0);
             return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
-    results = (Result*)malloc(INITIAL_CAPACITY * sizeof(Result));
-    result_capacity = INITIAL_CAPACITY;
-    InitializeCriticalSection(&result_lock);
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    entries = (Entry*)malloc(INITIAL_CAPACITY * sizeof(Entry));
+    entry_capacity = INITIAL_CAPACITY;
+    InitializeCriticalSection(&data_lock);
 
-    if (__argc > 1) strcpy(root_directory, __argv[1]);
-    else GetCurrentDirectoryA(MAX_PATH_LEN, root_directory);
+    if (__argc > 1) GetFullPathNameA(__argv[1], 4096, root_path, NULL);
 
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
+    wc.hInstance = hInst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "BladeWindowClass";
-    wc.style = CS_HREDRAW | CS_VREDRAW; 
+    wc.lpszClassName = "BladeClass";
     RegisterClassA(&wc);
 
-    hMainWnd = CreateWindowExA(0, "BladeWindowClass", "Blade Search",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
-        NULL, NULL, hInstance, NULL);
-
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    hMainWnd = CreateWindowExA(0, "BladeClass", "Blade", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 
+        CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, NULL, NULL, hInst, NULL);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -452,8 +626,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
         DispatchMessage(&msg);
     }
 
-    running = 0;
-    DeleteCriticalSection(&result_lock);
-    free(results);
     return 0;
 }

@@ -40,7 +40,9 @@ For easy access from any terminal, add the `frostmourne` directory to your Windo
 
 **GCC (MinGW):**
 ```bash
-gcc -O3 -mavx2 frostmourne_tui.c -o frostmourne.exe
+gcc -O3 -mavx2 blade_tui.c -o blade.exe
+
+gcc -O3 -mavx2 -mwindows blade_gui.c -o bladegui.exe -lgdi32 -luser32 -lshell32
 ```
 
 
