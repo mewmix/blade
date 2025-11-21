@@ -1,6 +1,6 @@
 [Setup]
 AppName=blade
-AppVersion=1.0.3
+AppVersion=1.0.4
 AppPublisher=Alex Klein
 AppPublisherURL=https://github.com/mewmix
 AppSupportURL=https://github.com/mewmix/blade/issues
