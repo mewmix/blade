@@ -19,15 +19,38 @@ SetupIconFile=blade_icon.ico
 UninstallDisplayIcon={app}\blade.exe
 
 [Files]
-Source: "blade.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "BladeExplorer.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "blade_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "blade.exe";           DestDir: "{app}"; Flags: ignoreversion
+Source: "BladeExplorer.exe";   DestDir: "{app}"; Flags: ignoreversion
+Source: "blade_icon.ico";      DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
 ; Add installation directory to system PATH for all users
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
     ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
     Check: NeedsAddPath('{app}')
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; \
+  GroupDescription: "Additional icons:"; Flags: unchecked
+
+[Icons]
+; Start Menu shortcuts
+Name: "{group}\Blade"; \
+  Filename: "{app}\blade.exe"; \
+  WorkingDir: "{app}"; \
+  IconFilename: "{app}\blade_icon.ico"
+
+Name: "{group}\Blade Explorer"; \
+  Filename: "{app}\BladeExplorer.exe"; \
+  WorkingDir: "{app}"; \
+  IconFilename: "{app}\blade_icon.ico"
+
+; Optional Desktop icon
+Name: "{autodesktop}\Blade"; \
+  Filename: "{app}\blade.exe"; \
+  WorkingDir: "{app}"; \
+  IconFilename: "{app}\blade_icon.ico"; \
+  Tasks: desktopicon
 
 [Code]
 function NeedsAddPath(Param: string): boolean;
