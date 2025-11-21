@@ -35,6 +35,7 @@
 #define CMD_COPY_ENTRY      1004
 #define CMD_PASTE_ENTRY     1005
 #define CMD_DELETE_ENTRY    1006
+#define CMD_RENAME_ENTRY    1007
 
 // Theme: "Void"
 #define COL_BG       RGB(10, 10, 10)
@@ -531,6 +532,106 @@ int hit_test_row(int x, int y) {
 }
 
 // ==========================================
+// INPUT BOX & RENAME LOGIC
+// ==========================================
+static char ib_result[MAX_PATH];
+static char ib_prompt[64];
+static int ib_success = 0;
+
+LRESULT CALLBACK InputBoxWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+        case WM_CREATE:
+            CreateWindow("STATIC", ib_prompt, WS_VISIBLE | WS_CHILD, 10, 10, 280, 20, hwnd, NULL, NULL, NULL);
+            HWND hEdit = CreateWindow("EDIT", ib_result, WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 10, 35, 280, 25, hwnd, (HMENU)100, NULL, NULL);
+            SendMessage(hEdit, EM_SETSEL, 0, -1);
+            SetFocus(hEdit);
+            CreateWindow("BUTTON", "OK", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 105, 75, 80, 25, hwnd, (HMENU)IDOK, NULL, NULL);
+            return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                GetWindowText(GetDlgItem(hwnd, 100), ib_result, MAX_PATH);
+                ib_success = 1;
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+int InputBox(HWND owner, const char *title, const char *prompt, char *buffer) {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = InputBoxWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "BladeInputBox";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    RegisterClassA(&wc);
+
+    strncpy(ib_result, buffer, MAX_PATH);
+    strncpy(ib_prompt, prompt, 64);
+    ib_success = 0;
+
+    RECT rcOwner; GetWindowRect(owner, &rcOwner);
+    int x = rcOwner.left + (rcOwner.right - rcOwner.left)/2 - 150;
+    int y = rcOwner.top + (rcOwner.bottom - rcOwner.top)/2 - 75;
+
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "BladeInputBox", title, 
+                               WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
+                               x, y, 320, 150, owner, NULL, GetModuleHandle(NULL), NULL);
+    
+    EnableWindow(owner, FALSE);
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
+    
+    if (ib_success) strcpy(buffer, ib_result);
+    return ib_success;
+}
+
+void rename_entry() {
+    char old_path[4096] = {0};
+    char old_name[MAX_PATH] = {0};
+    
+    EnterCriticalSection(&data_lock);
+    if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) {
+        lstrcpynA(old_path, entries[selected_index].path, 4096);
+        const char *disp = get_display_name(old_path);
+        lstrcpynA(old_name, disp, MAX_PATH);
+    }
+    LeaveCriticalSection(&data_lock);
+
+    if (old_path[0] == 0) return;
+
+    char new_name[MAX_PATH];
+    strcpy(new_name, old_name);
+
+    if (InputBox(hMainWnd, "Rename", "Enter new name:", new_name)) {
+        if (strcmp(old_name, new_name) == 0) return;
+
+        char new_path[4096];
+        strcpy(new_path, old_path);
+        char *slash = strrchr(new_path, '\\');
+        if (slash) *(slash+1) = 0;
+        strcat(new_path, new_name);
+
+        if (MoveFileA(old_path, new_path)) {
+            refresh_state();
+        } else {
+            MessageBoxA(hMainWnd, "Failed to rename file.", "Error", MB_ICONERROR);
+        }
+    }
+}
+
+// ==========================================
 // FILE OPERATIONS
 // ==========================================
 void delete_to_recycle(const char *path) {
@@ -587,6 +688,7 @@ void show_context_menu(int x, int y) {
     AppendMenuA(hMenu, MF_STRING, CMD_OPEN_EXPLORER, "Open in Explorer");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, CMD_NEW_FOLDER, "New Folder");
+    AppendMenuA(hMenu, MF_STRING, CMD_RENAME_ENTRY, "Rename (F2)");
     AppendMenuA(hMenu, MF_STRING, CMD_COPY_ENTRY, "Copy");
     AppendMenuA(hMenu, MF_STRING|(g_copy_source[0]?0:MF_GRAYED), CMD_PASTE_ENTRY, "Paste");
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
@@ -706,7 +808,7 @@ void Render(HDC hdcDest) {
             " Search:     Type to hunt recursively",
             " Filters:    ext:.log  >100mb  <5kb",
             " Ops:        Ctrl+C/V (Copy/Paste)",
-            "             Del (Recycle Bin)",
+            "             F2 (Rename), Del (Recycle Bin)",
             "             Ctrl+Shift+N (New Folder)",
             "             Ctrl+Shift+C (Copy Path)",
             " Sort:       F3 (Name), F4 (Size), F5 (Date)",
@@ -790,6 +892,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                 }
                 case CMD_NEW_FOLDER: create_new_folder(); break;
+                case CMD_RENAME_ENTRY: rename_entry(); break;
                 case CMD_COPY_ENTRY: set_copy_from_selection(); break;
                 case CMD_PASTE_ENTRY: copy_to_current_dir_from_buffer(); break;
                 case CMD_DELETE_ENTRY: {
@@ -818,6 +921,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case VK_PRIOR: selected_index -= max_visible_items; break;
                 case VK_NEXT: selected_index += max_visible_items; break;
                 case VK_DELETE: SendMessage(hwnd, WM_COMMAND, CMD_DELETE_ENTRY, 0); break;
+                case VK_F2: SendMessage(hwnd, WM_COMMAND, CMD_RENAME_ENTRY, 0); break;
                 case VK_F3: g_sort_mode = SORT_NAME; sort_entries(); break;
                 case VK_F4: g_sort_mode = SORT_SIZE; sort_entries(); break;
                 case VK_F5: g_sort_mode = SORT_DATE; sort_entries(); break;
