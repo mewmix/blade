@@ -433,18 +433,50 @@ unsigned __stdcall hunter_thread(void *arg) {
 void refresh_state() {
     InterlockedIncrement(&search_generation);
     parse_query();
-    int browse_mode = (strlen(search_buffer) == 0);
-    if (browse_mode) {
+
+    // 1. Construct a potential full path from the search buffer
+    char target_path[4096] = {0};
+    int is_absolute = (search_buffer[1] == ':' || (search_buffer[0] == '\\' && search_buffer[1] == '\\'));
+
+    if (is_absolute) {
+        // User typed absolute path (e.g. "C:\Windows")
+        lstrcpynA(target_path, search_buffer, 4096);
+    } 
+    else if (strlen(root_path) > 0) {
+        // User typed relative path (e.g. "Users") -> "C:\Users"
+        // Handle trailing slash on root_path to avoid double slashes (C:\\Users)
+        size_t root_len = strlen(root_path);
+        if (root_path[root_len - 1] == '\\')
+            snprintf(target_path, 4096, "%s%s", root_path, search_buffer);
+        else
+            snprintf(target_path, 4096, "%s\\%s", root_path, search_buffer);
+    }
+
+    // 2. Check if this path actually exists and is a Directory
+    DWORD attr = (target_path[0]) ? GetFileAttributesA(target_path) : INVALID_FILE_ATTRIBUTES;
+    int is_valid_dir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+
+    // 3. Decide: Browse (List) vs Hunt (Search)
+    
+    // MODE A: Buffer is empty -> Standard Directory Browsing
+    if (strlen(search_buffer) == 0) {
         if (strlen(root_path) == 0) list_drives();
         else list_directory(root_path);
-    } else {
+    }
+    // MODE B: Input matches a Directory -> Show that directory's contents (Live Preview)
+    else if (is_valid_dir) {
+        list_directory(target_path);
+    }
+    // MODE C: Input is just text -> Recursive File Search (Hunter)
+    else {
         clear_data();
         is_wildcard = (strchr(query.name, '*') || strchr(query.name, '?'));
-        for (int i = 0; i < THREAD_COUNT; i++) _beginthreadex(NULL, 0, hunter_thread, (void*)(intptr_t)search_generation, 0, NULL);
+        for (int i = 0; i < THREAD_COUNT; i++) 
+            _beginthreadex(NULL, 0, hunter_thread, (void*)(intptr_t)search_generation, 0, NULL);
     }
+
     InvalidateRect(hMainWnd, NULL, FALSE);
 }
-
 // ==========================================
 // NAVIGATION HELPERS
 // ==========================================
@@ -926,20 +958,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case VK_F4: g_sort_mode = SORT_SIZE; sort_entries(); break;
                 case VK_F5: g_sort_mode = SORT_DATE; sort_entries(); break;
                 case VK_RETURN: {
-                    if (GetKeyState(VK_CONTROL) & 0x8000) { EnterCriticalSection(&data_lock); if (entry_count > 0) open_in_explorer(entries[selected_index].path); LeaveCriticalSection(&data_lock); }
-                    else { 
-                        if (strchr(search_buffer, '\\') || (search_buffer[1] == ':')) {
-                            DWORD a = GetFileAttributesA(search_buffer);
-                            if (a != INVALID_FILE_ATTRIBUTES) {
-                                if (a & FILE_ATTRIBUTE_DIRECTORY) { strcpy(root_path, search_buffer); search_buffer[0]=0; refresh_state(); }
-                                else open_path(search_buffer);
-                                break;
-                            }
-                        }
-                        navigate_down();
-                    }
-                    break;
+                // Handle Ctrl+Enter (Open in Explorer)
+                if (GetKeyState(VK_CONTROL) & 0x8000) { 
+                    EnterCriticalSection(&data_lock); 
+                    if (entry_count > 0) open_in_explorer(entries[selected_index].path); 
+                    LeaveCriticalSection(&data_lock); 
                 }
+                else { 
+                    // 1. Construct a potential full path from the search buffer
+                    char target_path[4096] = {0};
+                    int is_absolute = (search_buffer[1] == ':' || (search_buffer[0] == '\\' && search_buffer[1] == '\\'));
+
+                    if (is_absolute) {
+                        // User typed "C:\Windows"
+                        lstrcpynA(target_path, search_buffer, 4096);
+                    } 
+                    else if (strlen(root_path) > 0 && strlen(search_buffer) > 0) {
+                        // User typed "Windows" while in "C:\" -> Resolve to "C:\Windows"
+                        snprintf(target_path, 4096, "%s\\%s", root_path, search_buffer);
+                    }
+
+                    // 2. Check if that manual path exists
+                    DWORD attr = (target_path[0]) ? GetFileAttributesA(target_path) : INVALID_FILE_ATTRIBUTES;
+
+                    if (attr != INVALID_FILE_ATTRIBUTES) {
+                        if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+                            // It's a folder: Navigate into it immediately
+                            strcpy(root_path, target_path);
+                            search_buffer[0] = 0;
+                            refresh_state();
+                        } else {
+                            // It's a file: Open it
+                            open_path(target_path);
+                        }
+                    } 
+                    else {
+                        // 3. Path invalid? Fallback to opening the currently selected search result
+                        navigate_down(); 
+                    }
+                }
+                return 0;
+            }
                 case 'C': {
                     SHORT ctrl = GetKeyState(VK_CONTROL); SHORT shift = GetKeyState(VK_SHIFT);
                     if ((ctrl&0x8000) && (shift&0x8000)) { EnterCriticalSection(&data_lock); if(entry_count>0) copy_to_clipboard(entries[selected_index].path); LeaveCriticalSection(&data_lock); } 
