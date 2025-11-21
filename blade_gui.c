@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <windowsx.h>
 #include <shellapi.h>
 #include <process.h>
 #include <stdio.h>
@@ -21,11 +22,19 @@
 #define MAX_RESULTS 200000
 #define INITIAL_CAPACITY 16384
 #define THREAD_COUNT 16
-#define ARENA_BLOCK_SIZE (32 * 1024 * 1024) // 32MB blocks for string arena
+#define ARENA_BLOCK_SIZE (32 * 1024 * 1024)
 #define FONT_NAME "Segoe UI"
 #define FONT_SIZE 20
 #define ROW_HEIGHT 28
-#define HEADER_HEIGHT 60
+#define HEADER_HEIGHT 70
+
+// Context menu command IDs
+#define CMD_OPEN            1001
+#define CMD_OPEN_EXPLORER   1002
+#define CMD_NEW_FOLDER      1003
+#define CMD_COPY_ENTRY      1004
+#define CMD_PASTE_ENTRY     1005
+#define CMD_DELETE_ENTRY    1006
 
 // Theme: "Void"
 #define COL_BG       RGB(10, 10, 10)
@@ -35,6 +44,8 @@
 #define COL_ACCENT   RGB(0, 120, 215)
 #define COL_SEL_TEXT RGB(255, 255, 255)
 #define COL_DIM      RGB(100, 100, 100)
+#define COL_HOVER    RGB(30, 30, 30)
+#define COL_HELP_BG  RGB(30, 30, 30)
 
 // ==========================================
 // DATA STRUCTURES
@@ -45,16 +56,15 @@ typedef struct {
     unsigned long long size;
     FILETIME write_time;
     
-    // Drive specific info (only valid if is_drive=1)
+    // Drive info
     int is_drive;
     unsigned long long total_bytes;
     unsigned long long free_bytes;
-    char fs_name[8];   // NTFS, FAT32
+    char fs_name[8];
 } Entry;
 
 typedef enum { SORT_NAME=0, SORT_SIZE, SORT_DATE } SORT_MODE;
 
-// Arena Allocator Structure
 typedef struct ArenaBlock {
     char *data;
     size_t used;
@@ -67,7 +77,7 @@ volatile long entry_count = 0;
 long entry_capacity = 0;
 CRITICAL_SECTION data_lock;
 
-ArenaBlock *arena_head = NULL; // Head of string arena
+ArenaBlock *arena_head = NULL; 
 
 // App State
 volatile int running = 1;
@@ -78,6 +88,11 @@ SORT_MODE g_sort_mode = SORT_NAME;
 char root_path[4096] = {0};
 char search_buffer[256] = {0};
 int is_wildcard = 0;
+int show_help = 0;
+
+// Copy/paste state
+char g_copy_source[4096] = {0};
+int  g_copy_is_dir = 0;
 
 // Search Query Parsed
 struct {
@@ -90,11 +105,13 @@ struct {
 // UI State
 HWND hMainWnd;
 int selected_index = 0;
+int hover_index = -1;
 int scroll_offset = 0;
 int window_width = 1024;
 int window_height = 768;
 int max_visible_items = 0;
 int is_truncated = 0;
+int list_start_y = 0;
 
 // GDI Resources
 HDC hdcBack = NULL;
@@ -102,13 +119,12 @@ HBITMAP hbmBack = NULL;
 HBITMAP hbmOld = NULL;
 HFONT hFont = NULL;
 HFONT hFontSmall = NULL;
+HFONT hFontMono = NULL;
 
 // ==========================================
-// ARENA ALLOCATOR (Zero-Overhead Strings)
+// ARENA ALLOCATOR
 // ==========================================
-void arena_init() {
-    arena_head = NULL;
-}
+void arena_init() { arena_head = NULL; }
 
 char* arena_alloc_str(const char *s) {
     size_t len = strlen(s) + 1;
@@ -139,7 +155,6 @@ void arena_free_all() {
 // ==========================================
 // UTILS & PARSING
 // ==========================================
-// FIX: Added missing stristr implementation
 const char* stristr(const char* haystack, const char* needle) {
     if (!*needle) return haystack;
     for (; *haystack; ++haystack) {
@@ -190,7 +205,7 @@ void parse_query() {
 // ==========================================
 void clear_data() {
     EnterCriticalSection(&data_lock);
-    arena_free_all(); // Free all strings instantly
+    arena_free_all(); 
     entry_count = 0;
     selected_index = 0;
     scroll_offset = 0;
@@ -355,7 +370,7 @@ void scan_recursive(char *path, long gen) {
 
         // 1. Name Filter
         int match = 0;
-        if (name_len == 0) match = 1; // Empty search matches everything (if filters apply)
+        if (name_len == 0) match = 1; 
         else {
             if (is_wildcard) match = fast_glob_match(fd.cFileName, query.name);
             else match = avx2_strcasestr(fd.cFileName, query.name, name_len);
@@ -403,7 +418,6 @@ void refresh_state() {
     InterlockedIncrement(&search_generation);
     parse_query();
     
-    // Heuristic: If no name/ext/size filter, browse mode
     int browse_mode = (strlen(search_buffer) == 0);
 
     if (browse_mode) {
@@ -449,6 +463,100 @@ void copy_to_clipboard(const char *s) {
     CloseClipboard();
 }
 
+void navigate_down() {
+    EnterCriticalSection(&data_lock);
+    if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) {
+        Entry *e = &entries[selected_index];
+        if (e->is_dir) {
+            strcpy(root_path, e->path);
+            search_buffer[0] = 0;
+            LeaveCriticalSection(&data_lock);
+            refresh_state();
+        } else {
+            open_path(e->path);
+            LeaveCriticalSection(&data_lock);
+        }
+    } else {
+        LeaveCriticalSection(&data_lock);
+    }
+}
+
+int hit_test_row(int x, int y) {
+    if (y < HEADER_HEIGHT + 5) return -1;
+    int row = (y - (HEADER_HEIGHT + 5)) / ROW_HEIGHT;
+    if (row < 0) return -1;
+    EnterCriticalSection(&data_lock);
+    int idx = scroll_offset + row;
+    if (idx < 0 || idx >= (int)entry_count) idx = -1;
+    LeaveCriticalSection(&data_lock);
+    return idx;
+}
+
+// ==========================================
+// FILE OPERATIONS
+// ==========================================
+void delete_to_recycle(const char *path) {
+    if (!path || !*path) return;
+    char from[4096 + 2]; lstrcpynA(from, path, 4096);
+    size_t len = strlen(from); from[len] = 0; from[len+1] = 0;
+    SHFILEOPSTRUCTA op = {0}; op.hwnd = hMainWnd; op.wFunc = FO_DELETE; op.pFrom = from; op.fFlags = FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_SILENT|FOF_NOERRORUI;
+    SHFileOperationA(&op);
+}
+
+void set_copy_from_selection() {
+    EnterCriticalSection(&data_lock);
+    if (entry_count>0 && selected_index>=0 && selected_index<entry_count) {
+        Entry *e = &entries[selected_index];
+        lstrcpynA(g_copy_source, e->path, 4096);
+        g_copy_is_dir = e->is_dir;
+    }
+    LeaveCriticalSection(&data_lock);
+}
+
+void copy_to_current_dir_from_buffer() {
+    if (!root_path[0] || !g_copy_source[0]) return;
+    char from[4096+2]; lstrcpynA(from, g_copy_source, 4096);
+    size_t len = strlen(from); from[len]=0; from[len+1]=0;
+    SHFILEOPSTRUCTA op = {0}; op.hwnd = hMainWnd; op.wFunc = FO_COPY; op.pFrom = from; op.pTo = root_path; op.fFlags = FOF_NOCONFIRMMKDIR|FOF_NOCONFIRMATION|FOF_NOERRORUI;
+    SHFileOperationA(&op);
+    refresh_state();
+}
+
+void create_new_folder() {
+    if (!root_path[0]) return;
+    char base[]="New Folder"; char full[4096]; int index=0;
+    for(;;) {
+        if(index==0) snprintf(full,4096,"%s\\%s",root_path,base);
+        else snprintf(full,4096,"%s\\%s (%d)",root_path,base,index);
+        if(GetFileAttributesA(full)==INVALID_FILE_ATTRIBUTES) break;
+        if(++index>1000) return;
+    }
+    if(CreateDirectoryA(full,NULL)) {
+        refresh_state();
+        EnterCriticalSection(&data_lock);
+        for(long i=0; i<entry_count; ++i) {
+            if(_stricmp(entries[i].path, full)==0) { selected_index=(int)i; break; }
+        }
+        LeaveCriticalSection(&data_lock);
+        InvalidateRect(hMainWnd, NULL, FALSE);
+    }
+}
+
+void show_context_menu(int x, int y) {
+    POINT pt = {x,y}; ClientToScreen(hMainWnd, &pt);
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuA(hMenu, MF_STRING, CMD_OPEN, "Open");
+    AppendMenuA(hMenu, MF_STRING, CMD_OPEN_EXPLORER, "Open in Explorer");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING, CMD_NEW_FOLDER, "New Folder");
+    AppendMenuA(hMenu, MF_STRING, CMD_COPY_ENTRY, "Copy");
+    AppendMenuA(hMenu, MF_STRING|(g_copy_source[0]?0:MF_GRAYED), CMD_PASTE_ENTRY, "Paste");
+    AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(hMenu, MF_STRING, CMD_DELETE_ENTRY, "Delete");
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON|TPM_LEFTALIGN, pt.x, pt.y, 0, hMainWnd, NULL);
+    DestroyMenu(hMenu);
+}
+
 // ==========================================
 // RENDERING
 // ==========================================
@@ -474,10 +582,17 @@ void Render(HDC hdcDest) {
 
     SetTextColor(hdcBack, COL_TEXT);
     char prompt[300];
-    if (strlen(search_buffer) > 0) snprintf(prompt, 300, "Query: %s  [Sort: F3/F4/F5]", search_buffer);
+    if (strlen(search_buffer) > 0) snprintf(prompt, 300, "Query: %s", search_buffer);
     else strcpy(prompt, "Type to hunt... (e.g. log ext:.txt >1mb)");
     SelectObject(hdcBack, hFontSmall);
     TextOutA(hdcBack, 10, 35, prompt, strlen(prompt));
+
+    // Draw Clickable Header Labels (Moved further right to avoid overlap)
+    int header_y = HEADER_HEIGHT - 20;
+    SetTextColor(hdcBack, COL_DIM);
+    TextOutA(hdcBack, window_width - 350, header_y, "Name (F3)", 9);
+    TextOutA(hdcBack, window_width - 220, header_y, "Size (F4)", 9);
+    TextOutA(hdcBack, window_width - 120, header_y, "Date (F5)", 9);
 
     char stats[128];
     snprintf(stats, 128, "%ld items %s %s", entry_count, active_workers > 0 ? "[BUSY]" : "", is_truncated ? "[LIMIT]" : "");
@@ -486,6 +601,7 @@ void Render(HDC hdcDest) {
 
     EnterCriticalSection(&data_lock);
     int start_y = HEADER_HEIGHT + 5;
+    list_start_y = start_y; 
     max_visible_items = (window_height - start_y) / ROW_HEIGHT;
 
     if (selected_index >= entry_count) selected_index = entry_count - 1;
@@ -500,11 +616,21 @@ void Render(HDC hdcDest) {
         int y = start_y + (i * ROW_HEIGHT);
         Entry *e = &entries[idx];
 
+        RECT rcRow = {10, y, window_width - 10, y + ROW_HEIGHT};
+
         if (idx == selected_index) {
-            RECT rcRow = {10, y, window_width - 10, y + ROW_HEIGHT};
-            FillRect(hdcBack, &rcRow, CreateSolidBrush(COL_ACCENT));
+            HBRUSH hSel = CreateSolidBrush(COL_ACCENT);
+            FillRect(hdcBack, &rcRow, hSel);
+            DeleteObject(hSel);
             SetTextColor(hdcBack, COL_SEL_TEXT);
-        } else SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
+        } else {
+            if (idx == hover_index) {
+                HBRUSH hHover = CreateSolidBrush(COL_HOVER);
+                FillRect(hdcBack, &rcRow, hHover);
+                DeleteObject(hHover);
+            }
+            SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
+        }
 
         const char *disp = get_display_name(e->path);
         TextOutA(hdcBack, 15, y, disp, strlen(disp));
@@ -524,7 +650,45 @@ void Render(HDC hdcDest) {
         }
     }
     LeaveCriticalSection(&data_lock);
+
+    // HELP OVERLAY
+    if (show_help) {
+        RECT rcHelp = {window_width/2 - 250, window_height/2 - 200, window_width/2 + 250, window_height/2 + 200};
+        HBRUSH hHelpBg = CreateSolidBrush(COL_HELP_BG);
+        FillRect(hdcBack, &rcHelp, hHelpBg);
+        DeleteObject(hHelpBg);
+        FrameRect(hdcBack, &rcHelp, CreateSolidBrush(COL_ACCENT)); // Border
+        
+        SetTextColor(hdcBack, COL_TEXT);
+        SelectObject(hdcBack, hFontMono);
+        const char *lines[] = {
+            " BLADE EXPLORER HELP (Ctrl+H)",
+            " ----------------------------",
+            " Navigation: Arrows, PageUp/Dn, Enter, Backspace",
+            " Search:     Type to hunt recursively",
+            " Filters:    ext:.log  >100mb  <5kb",
+            " Ops:        Ctrl+C/V (Copy/Paste)",
+            "             Del (Recycle Bin)",
+            "             Ctrl+Shift+N (New Folder)",
+            "             Ctrl+Shift+C (Copy Path)",
+            " Sort:       F3 (Name), F4 (Size), F5 (Date)",
+            " Power:      Ctrl+L (Copy Current Path)",
+            "             Ctrl+O (Open CMD Here)",
+            "             Ctrl+Enter (Open in Explorer)"
+        };
+        for(int i=0; i<13; i++) TextOutA(hdcBack, rcHelp.left + 20, rcHelp.top + 20 + (i*25), lines[i], strlen(lines[i]));
+    }
+
     BitBlt(hdcDest, 0, 0, window_width, window_height, hdcBack, 0, 0, SRCCOPY);
+}
+
+void header_click(int x, int y) {
+    int header_y = HEADER_HEIGHT - 20;
+    if (y < header_y - 5 || y > header_y + 20) return;
+    if (x < window_width - 250) g_sort_mode = SORT_NAME;
+    else if (x < window_width - 150) g_sort_mode = SORT_SIZE;
+    else g_sort_mode = SORT_DATE;
+    sort_entries();
 }
 
 // ==========================================
@@ -535,6 +699,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE:
             hFont = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             hFontSmall = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            hFontMono = CreateFontA(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Consolas");
             refresh_state();
             SetTimer(hwnd, 1, 100, NULL);
             return 0;
@@ -545,24 +710,81 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_PAINT: { PAINTSTRUCT ps; HDC h = BeginPaint(hwnd, &ps); Render(h); EndPaint(hwnd, &ps); return 0; }
         case WM_MOUSEWHEEL: if ((short)HIWORD(wParam) > 0) scroll_offset -= 3; else scroll_offset += 3; if (scroll_offset < 0) scroll_offset = 0; InvalidateRect(hwnd, NULL, FALSE); return 0;
+        
+        case WM_MOUSEMOVE: {
+            int idx = hit_test_row(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (idx != hover_index) { hover_index = idx; InvalidateRect(hwnd, NULL, FALSE); }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            SetFocus(hwnd);
+            if (show_help) { show_help = 0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            int x = GET_X_LPARAM(lParam); int y = GET_Y_LPARAM(lParam);
+            if (y < HEADER_HEIGHT) { header_click(x, y); return 0; }
+            int idx = hit_test_row(x, y);
+            if (idx >= 0) { selected_index = idx; InvalidateRect(hwnd, NULL, FALSE); }
+            return 0;
+        }
+        case WM_LBUTTONDBLCLK: {
+            int idx = hit_test_row(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (idx >= 0) {
+                selected_index = idx; InvalidateRect(hwnd, NULL, FALSE);
+                navigate_down();
+            }
+            return 0;
+        }
+        case WM_RBUTTONUP: {
+            int x = GET_X_LPARAM(lParam); int y = GET_Y_LPARAM(lParam);
+            int idx = hit_test_row(x, y);
+            if (idx >= 0) { selected_index = idx; InvalidateRect(hwnd, NULL, FALSE); }
+            show_context_menu(x, y);
+            return 0;
+        }
+
+        case WM_COMMAND: {
+            switch (LOWORD(wParam)) {
+                case CMD_OPEN: navigate_down(); break;
+                case CMD_OPEN_EXPLORER: {
+                    EnterCriticalSection(&data_lock);
+                    if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) open_in_explorer(entries[selected_index].path);
+                    LeaveCriticalSection(&data_lock);
+                    break;
+                }
+                case CMD_NEW_FOLDER: create_new_folder(); break;
+                case CMD_COPY_ENTRY: set_copy_from_selection(); break;
+                case CMD_PASTE_ENTRY: copy_to_current_dir_from_buffer(); break;
+                case CMD_DELETE_ENTRY: {
+                    char path[4096] = {0};
+                    EnterCriticalSection(&data_lock);
+                    if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) lstrcpynA(path, entries[selected_index].path, 4096);
+                    LeaveCriticalSection(&data_lock);
+                    if (path[0]) { delete_to_recycle(path); refresh_state(); }
+                    break;
+                }
+            }
+            return 0;
+        }
+
         case WM_CHAR:
+            if (show_help) { show_help=0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
             if (wParam == VK_ESCAPE) { if (strlen(search_buffer)>0) { search_buffer[0]=0; refresh_state(); } else PostQuitMessage(0); }
             else if (wParam == VK_BACK) { int l=strlen(search_buffer); if(l>0) search_buffer[l-1]=0; else navigate_up(); refresh_state(); }
             else if (wParam >= 32 && wParam < 127 && strlen(search_buffer) < 250) { int l=strlen(search_buffer); search_buffer[l]=(char)wParam; search_buffer[l+1]=0; refresh_state(); }
             return 0;
         case WM_KEYDOWN:
+            if (show_help) { show_help=0; InvalidateRect(hwnd, NULL, FALSE); return 0; }
             switch(wParam) {
                 case VK_UP: if (selected_index > 0) selected_index--; break;
                 case VK_DOWN: selected_index++; break;
                 case VK_PRIOR: selected_index -= max_visible_items; break;
                 case VK_NEXT: selected_index += max_visible_items; break;
+                case VK_DELETE: SendMessage(hwnd, WM_COMMAND, CMD_DELETE_ENTRY, 0); break;
                 case VK_F3: g_sort_mode = SORT_NAME; sort_entries(); break;
                 case VK_F4: g_sort_mode = SORT_SIZE; sort_entries(); break;
                 case VK_F5: g_sort_mode = SORT_DATE; sort_entries(); break;
                 case VK_RETURN: {
                     if (GetKeyState(VK_CONTROL) & 0x8000) { EnterCriticalSection(&data_lock); if (entry_count > 0) open_in_explorer(entries[selected_index].path); LeaveCriticalSection(&data_lock); }
                     else { 
-                        // Try to parse as path first
                         if (strchr(search_buffer, '\\') || (search_buffer[1] == ':')) {
                             DWORD a = GetFileAttributesA(search_buffer);
                             if (a != INVALID_FILE_ATTRIBUTES) {
@@ -571,18 +793,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                 break;
                             }
                         }
-                        if (entry_count > 0) {
-                            EnterCriticalSection(&data_lock);
-                            Entry *e = &entries[selected_index];
-                            if (e->is_dir) { strcpy(root_path, e->path); search_buffer[0]=0; refresh_state(); }
-                            else open_path(e->path);
-                            LeaveCriticalSection(&data_lock);
-                        }
+                        navigate_down();
                     }
                     break;
                 }
-                case 'C': if ((GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)) { EnterCriticalSection(&data_lock); if(entry_count>0) copy_to_clipboard(entries[selected_index].path); LeaveCriticalSection(&data_lock); } break;
+                case 'C': {
+                    SHORT ctrl = GetKeyState(VK_CONTROL); SHORT shift = GetKeyState(VK_SHIFT);
+                    if ((ctrl&0x8000) && (shift&0x8000)) { EnterCriticalSection(&data_lock); if(entry_count>0) copy_to_clipboard(entries[selected_index].path); LeaveCriticalSection(&data_lock); } 
+                    else if (ctrl&0x8000) SendMessage(hwnd, WM_COMMAND, CMD_COPY_ENTRY, 0);
+                    break;
+                }
+                case 'V': if (GetKeyState(VK_CONTROL)&0x8000) SendMessage(hwnd, WM_COMMAND, CMD_PASTE_ENTRY, 0); break;
+                case 'N': if ((GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)) SendMessage(hwnd, WM_COMMAND, CMD_NEW_FOLDER, 0); break;
                 case 'L': if (GetKeyState(VK_CONTROL)&0x8000) copy_to_clipboard(root_path); break;
+                case 'H': if (GetKeyState(VK_CONTROL)&0x8000) { show_help = !show_help; InvalidateRect(hwnd, NULL, FALSE); } break;
                 case 'O': if (GetKeyState(VK_CONTROL)&0x8000 && root_path[0]) { char c[4096]; snprintf(c,4096,"/K cd /d \"%s\"", root_path); ShellExecuteA(NULL,"open","cmd.exe",c,root_path,SW_SHOWDEFAULT); } break;
             }
             InvalidateRect(hwnd, NULL, FALSE);
@@ -597,7 +821,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
     entry_capacity = INITIAL_CAPACITY;
     InitializeCriticalSection(&data_lock);
     if (__argc > 1) GetFullPathNameA(__argv[1], 4096, root_path, NULL);
-    WNDCLASSA wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.lpszClassName = "BladeClass"; RegisterClassA(&wc);
+    WNDCLASSA wc = {0}; 
+    wc.style = CS_DBLCLKS; 
+    wc.lpfnWndProc = WndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.lpszClassName = "BladeClass"; RegisterClassA(&wc);
     hMainWnd = CreateWindowExA(0, "BladeClass", "Blade Explorer", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, NULL, NULL, hInst, NULL);
     MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return 0;
