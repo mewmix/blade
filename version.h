@@ -1,2 +1,2 @@
 #define VERSION "1.0.2" 
-#define COMMIT_SHA "d3034fe264097c3e6bd2dd69f13773a41cb56345" 
+$1847a4a1611de553d253fc8a1bb66d3c739ff96d9" 

@@ -55,8 +55,6 @@ typedef struct {
     int is_dir;
     unsigned long long size;
     FILETIME write_time;
-    
-    // Drive info
     int is_drive;
     unsigned long long total_bytes;
     unsigned long long free_bytes;
@@ -64,6 +62,7 @@ typedef struct {
 } Entry;
 
 typedef enum { SORT_NAME=0, SORT_SIZE, SORT_DATE } SORT_MODE;
+typedef enum { CTRL_O_WT=0, CTRL_O_CMD, CTRL_O_EXPLORER } CTRL_O_MODE;
 
 typedef struct ArenaBlock {
     char *data;
@@ -84,9 +83,11 @@ volatile int running = 1;
 volatile long active_workers = 0;
 volatile long search_generation = 0;
 SORT_MODE g_sort_mode = SORT_NAME;
+CTRL_O_MODE g_ctrl_o_mode = CTRL_O_WT; // Default to Windows Terminal
 
 char root_path[4096] = {0};
 char search_buffer[256] = {0};
+char g_ini_path[MAX_PATH] = {0};
 int is_wildcard = 0;
 int show_help = 0;
 
@@ -120,6 +121,23 @@ HBITMAP hbmOld = NULL;
 HFONT hFont = NULL;
 HFONT hFontSmall = NULL;
 HFONT hFontMono = NULL;
+
+// ==========================================
+// SETTINGS LOADING
+// ==========================================
+void load_settings() {
+    GetModuleFileNameA(NULL, g_ini_path, MAX_PATH);
+    char *last_slash = strrchr(g_ini_path, '\\');
+    if (last_slash) *(last_slash + 1) = 0;
+    strcat(g_ini_path, "blade.ini");
+
+    char buf[32] = {0};
+    GetPrivateProfileStringA("General", "CtrlO", "wt", buf, 32, g_ini_path);
+    
+    if (_stricmp(buf, "cmd") == 0) g_ctrl_o_mode = CTRL_O_CMD;
+    else if (_stricmp(buf, "explorer") == 0) g_ctrl_o_mode = CTRL_O_EXPLORER;
+    else g_ctrl_o_mode = CTRL_O_WT;
+}
 
 // ==========================================
 // ARENA ALLOCATOR
@@ -304,7 +322,7 @@ int __cdecl entry_cmp(const void *pa, const void *pb) {
             break;
         case SORT_DATE: {
             LONG c = CompareFileTime(&a->write_time, &b->write_time);
-            if (c != 0) return -c; // Newest first
+            if (c != 0) return -c;
             break;
         }
     }
@@ -368,7 +386,6 @@ void scan_recursive(char *path, long gen) {
         if (gen != search_generation) break;
         if (fd.cFileName[0] == '.') continue;
 
-        // 1. Name Filter
         int match = 0;
         if (name_len == 0) match = 1; 
         else {
@@ -376,13 +393,11 @@ void scan_recursive(char *path, long gen) {
             else match = avx2_strcasestr(fd.cFileName, query.name, name_len);
         }
 
-        // 2. Extension Filter
         if (match && query.ext[0]) {
             const char *dot = strrchr(fd.cFileName, '.');
             if (!dot || _stricmp(dot, query.ext) != 0) match = 0;
         }
 
-        // 3. Size Filter
         unsigned long long sz = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
         if (match && query.min_size && sz < query.min_size) match = 0;
         if (match && query.max_size && sz > query.max_size) match = 0;
@@ -417,9 +432,7 @@ unsigned __stdcall hunter_thread(void *arg) {
 void refresh_state() {
     InterlockedIncrement(&search_generation);
     parse_query();
-    
     int browse_mode = (strlen(search_buffer) == 0);
-
     if (browse_mode) {
         if (strlen(root_path) == 0) list_drives();
         else list_directory(root_path);
@@ -478,6 +491,31 @@ void navigate_down() {
         }
     } else {
         LeaveCriticalSection(&data_lock);
+    }
+}
+
+void handle_ctrl_o() {
+    char target[4096] = {0};
+    EnterCriticalSection(&data_lock);
+    if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) {
+        Entry *e = &entries[selected_index];
+        if (e->is_dir) strcpy(target, e->path);
+        else {
+            strcpy(target, e->path);
+            char *slash = strrchr(target, '\\');
+            if(slash) *slash=0;
+        }
+    }
+    LeaveCriticalSection(&data_lock);
+    
+    if (!target[0] && root_path[0]) strcpy(target, root_path);
+    if (!target[0]) return;
+
+    char args[8192];
+    switch (g_ctrl_o_mode) {
+        case CTRL_O_WT: snprintf(args, 8192, "-d \"%s\"", target); ShellExecuteA(NULL, "open", "wt.exe", args, target, SW_SHOWDEFAULT); break;
+        case CTRL_O_CMD: snprintf(args, 8192, "/K cd /d \"%s\"", target); ShellExecuteA(NULL, "open", "cmd.exe", args, target, SW_SHOWDEFAULT); break;
+        case CTRL_O_EXPLORER: ShellExecuteA(NULL, "open", "explorer.exe", target, NULL, SW_SHOWNORMAL); break;
     }
 }
 
@@ -657,7 +695,7 @@ void Render(HDC hdcDest) {
         HBRUSH hHelpBg = CreateSolidBrush(COL_HELP_BG);
         FillRect(hdcBack, &rcHelp, hHelpBg);
         DeleteObject(hHelpBg);
-        FrameRect(hdcBack, &rcHelp, CreateSolidBrush(COL_ACCENT)); // Border
+        FrameRect(hdcBack, &rcHelp, CreateSolidBrush(COL_ACCENT)); 
         
         SetTextColor(hdcBack, COL_TEXT);
         SelectObject(hdcBack, hFontMono);
@@ -673,7 +711,7 @@ void Render(HDC hdcDest) {
             "             Ctrl+Shift+C (Copy Path)",
             " Sort:       F3 (Name), F4 (Size), F5 (Date)",
             " Power:      Ctrl+L (Copy Current Path)",
-            "             Ctrl+O (Open CMD Here)",
+            "             Ctrl+O (Open Here - configurable)",
             "             Ctrl+Enter (Open in Explorer)"
         };
         for(int i=0; i<13; i++) TextOutA(hdcBack, rcHelp.left + 20, rcHelp.top + 20 + (i*25), lines[i], strlen(lines[i]));
@@ -700,6 +738,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hFont = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             hFontSmall = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             hFontMono = CreateFontA(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Consolas");
+            load_settings();
             refresh_state();
             SetTimer(hwnd, 1, 100, NULL);
             return 0;
@@ -807,7 +846,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case 'N': if ((GetKeyState(VK_CONTROL)&0x8000) && (GetKeyState(VK_SHIFT)&0x8000)) SendMessage(hwnd, WM_COMMAND, CMD_NEW_FOLDER, 0); break;
                 case 'L': if (GetKeyState(VK_CONTROL)&0x8000) copy_to_clipboard(root_path); break;
                 case 'H': if (GetKeyState(VK_CONTROL)&0x8000) { show_help = !show_help; InvalidateRect(hwnd, NULL, FALSE); } break;
-                case 'O': if (GetKeyState(VK_CONTROL)&0x8000 && root_path[0]) { char c[4096]; snprintf(c,4096,"/K cd /d \"%s\"", root_path); ShellExecuteA(NULL,"open","cmd.exe",c,root_path,SW_SHOWDEFAULT); } break;
+                case 'O': if (GetKeyState(VK_CONTROL)&0x8000) handle_ctrl_o(); break;
             }
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
