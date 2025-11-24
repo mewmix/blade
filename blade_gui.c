@@ -828,7 +828,10 @@ int InputBox(HWND owner, const char *title, char *buffer) {
 void rename_entry() {
     char path[4096]; 
     EnterCriticalSection(&data_lock);
-    if(entry_count>0 && selected_index < entry_count) strcpy(path, entries[selected_index].path);
+    if(entry_count>0 && selected_index < entry_count) {
+        if (entries[selected_index].is_drive) { LeaveCriticalSection(&data_lock); return; }
+        strcpy(path, entries[selected_index].path);
+    }
     LeaveCriticalSection(&data_lock);
     char name[MAX_PATH]; strcpy(name, get_display_name(path));
     if (InputBox(hMainWnd, "Rename", name)) {
@@ -849,6 +852,44 @@ void format_size(unsigned long long bytes, char *out) {
     sprintf(out, "%.1f %s", d, u[i]);
 }
 
+void DrawHelp(HDC hdc) {
+    if (!show_help) return;
+    
+    RECT rc = {0, 0, window_width, window_height};
+    FillRect(hdc, &rc, CreateSolidBrush(COL_HELP_BG)); // Dark overlay
+    
+    SetTextColor(hdc, COL_ACCENT);
+    SelectObject(hdc, hFontBold);
+    TextOutA(hdc, 50, 50, "Blade Explorer - Help", 21);
+    
+    SetTextColor(hdc, COL_TEXT);
+    SelectObject(hdc, hFont);
+    
+    const char *lines[] = {
+        "Navigation:",
+        "  Arrows / Mouse : Navigate items",
+        "  Enter          : Open folder / Launch file",
+        "  Backspace      : Go Up / Back",
+        "  Type           : Instant Search (Glob/Fuzzy)",
+        "",
+        "Commands:",
+        "  F2             : Rename selected item",
+        "  F3 / F4 / F5   : Sort by Name / Size / Date",
+        "  F6             : Toggle Grid / List View",
+        "  F7             : Cycle Stacks (Time, Type, Context)",
+        "  Del            : Delete item",
+        "  Ctrl + O       : Open Terminal Here",
+        "  Ctrl + H       : Toggle this Help",
+        "  Esc            : Clear Search / Exit Help / Quit"
+    };
+    
+    int y = 100;
+    for (int i = 0; i < 15; i++) {
+        TextOutA(hdc, 50, y, lines[i], strlen(lines[i]));
+        y += 30;
+    }
+}
+
 void Render(HDC hdcDest) {
     if (!hdcBack) return;
     RECT rc = {0, 0, window_width, window_height};
@@ -864,7 +905,7 @@ void Render(HDC hdcDest) {
     SetTextColor(hdcBack, COL_TEXT);
     char prompt[300];
     if (strlen(search_buffer) > 0) snprintf(prompt, 300, "Query: %s", search_buffer);
-    else strcpy(prompt, "Type to hunt... (F7: Stacks)");
+    else strcpy(prompt, "Type to hunt... (Ctrl+H for Help)");
     SelectObject(hdcBack, hFontSmall);
     TextOutA(hdcBack, 10, 35, prompt, strlen(prompt));
 
@@ -891,45 +932,74 @@ void Render(HDC hdcDest) {
     if (scroll_offset < 0) scroll_offset = 0;
 
     int y = HEADER_HEIGHT + 5;
+    
+    // State tracking for headers
     STACK_TYPE current_stack = STACK_NONE;
-    // Initialize current_stack based on previous item if we are scrolling
-    if (scroll_offset > 0 && entry_count > 0) current_stack = entries[scroll_offset-1].stack;
+    SECTION_TYPE current_section = SEC_NONE;
+    
+    // Initialize state based on previous item if scrolling
+    if (scroll_offset > 0 && entry_count > 0) {
+        current_stack = entries[scroll_offset-1].stack;
+        current_section = entries[scroll_offset-1].section;
+    }
 
     for (int i = scroll_offset; i < entry_count; i++) {
         if (y > window_height) break;
         
         Entry *e = &entries[i];
-        int is_new_stack = (i == 0) || (e->stack != current_stack);
         
-        // Find start of stack to calculate grid position
-        int start_of_stack = i;
-        while (start_of_stack > 0 && entries[start_of_stack-1].stack == e->stack) start_of_stack--;
-        int stack_item_index = i - start_of_stack;
-
-        if (is_new_stack) {
-            current_stack = e->stack;
-            // Draw Header
-            if (g_stack_mode != STACKMODE_NONE) {
-                RECT rcH = {0, y, window_width, y + 24};
-                FillRect(hdcBack, &rcH, CreateSolidBrush(COL_HOVER));
-                SetTextColor(hdcBack, COL_SECTION);
-                SelectObject(hdcBack, hFontBold);
-                const char *sn = get_stack_name(e->stack);
-                TextOutA(hdcBack, 10, y + 2, sn, strlen(sn));
-                y += 28;
+        // Determine if we need a header
+        int draw_header = 0;
+        char header_text[128] = {0};
+        
+        // Priority: Sections (Home View) > Stacks
+        int use_sections = (strlen(root_path) == 0 && g_stack_mode == STACKMODE_NONE);
+        
+        if (use_sections) {
+            if (i == 0 || e->section != current_section) {
+                draw_header = 1;
+                current_section = e->section;
+                const char* sec_names[] = {"", "Core Folders", "Favorites", "Recent", "Drives"};
+                if (e->section < 5) strcpy(header_text, sec_names[e->section]);
+                else strcpy(header_text, "Other");
+            }
+        } else {
+            if (i == 0 || e->stack != current_stack) {
+                draw_header = 1;
+                current_stack = e->stack;
+                if (g_stack_mode != STACKMODE_NONE) strcpy(header_text, get_stack_name(e->stack));
+                else draw_header = 0; // No headers in flat mode
             }
         }
+
+        // Draw Header
+        if (draw_header && header_text[0]) {
+            RECT rcH = {0, y, window_width, y + 24};
+            FillRect(hdcBack, &rcH, CreateSolidBrush(COL_HOVER));
+            SetTextColor(hdcBack, COL_SECTION);
+            SelectObject(hdcBack, hFontBold);
+            TextOutA(hdcBack, 10, y + 2, header_text, strlen(header_text));
+            y += 28;
+        }
+
+        // Calculate Item Position
+        // Find start of current group (stack or section) to calculate grid position relative to group start
+        int start_of_group = i;
+        if (use_sections) {
+            while (start_of_group > 0 && entries[start_of_group-1].section == e->section) start_of_group--;
+        } else {
+            while (start_of_group > 0 && entries[start_of_group-1].stack == e->stack) start_of_group--;
+        }
+        int group_item_index = i - start_of_group;
 
         int x, w, h;
         if (g_view_mode == VIEWMODE_LIST) {
             x = 10; 
             w = window_width - 20; h = ROW_HEIGHT;
-            // y is already set
         } else {
-            int col = stack_item_index % items_per_row;
+            int col = group_item_index % items_per_row;
             x = 10 + (col * GRID_ITEM_WIDTH);
             w = GRID_ITEM_WIDTH - 5; h = GRID_ITEM_HEIGHT - 5;
-            // y is set, but we only increment it when we complete a row
         }
 
         RECT rcItem = {x, y, x + w, y + h};
@@ -951,7 +1021,11 @@ void Render(HDC hdcDest) {
             TextOutA(hdcBack, x + 5, y, disp, strlen(disp));
             SelectObject(hdcBack, hFontSmall);
             char meta[128] = {0};
-            if (!e->is_dir) format_size(e->size, meta);
+            if (e->is_drive) {
+                char f[32], t[32]; format_size(e->free_bytes, f); format_size(e->total_bytes, t);
+                snprintf(meta, 128, "[%s] %s free of %s", e->fs_name, f, t);
+            } else if (!e->is_dir) format_size(e->size, meta);
+            
             if (meta[0]) {
                 SIZE sz; GetTextExtentPoint32A(hdcBack, meta, strlen(meta), &sz);
                 TextOutA(hdcBack, window_width - sz.cx - 20, y, meta, strlen(meta));
@@ -968,42 +1042,73 @@ void Render(HDC hdcDest) {
             RECT rcText = {x, y + 60, x + w, y + h};
             DrawTextA(hdcBack, disp, -1, &rcText, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
             
-            // Increment Y only if end of row or next is new stack or end of list
-            int next_is_new = (i + 1 < entry_count) && (entries[i+1].stack != current_stack);
-            if ((stack_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
+            // Increment Y only if end of row or next is new group or end of list
+            int next_is_new = 0;
+            if (i + 1 < entry_count) {
+                if (use_sections) next_is_new = (entries[i+1].section != current_section);
+                else next_is_new = (entries[i+1].stack != current_stack);
+            }
+            
+            if ((group_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
                 y += GRID_ITEM_HEIGHT;
             }
         }
     }
     LeaveCriticalSection(&data_lock);
+    
+    if (show_help) DrawHelp(hdcBack);
+    
     BitBlt(hdcDest, 0, 0, window_width, window_height, hdcBack, 0, 0, SRCCOPY);
 }
 
 int hit_test_index(int x, int y) {
+    if (show_help) return -1; // No clicks when help is open
     if (y < HEADER_HEIGHT + 5) return -1;
     
     EnterCriticalSection(&data_lock);
     int cur_y = HEADER_HEIGHT + 5;
+    
     STACK_TYPE current_stack = STACK_NONE;
-    if (scroll_offset > 0 && entry_count > 0) current_stack = entries[scroll_offset-1].stack;
+    SECTION_TYPE current_section = SEC_NONE;
+    
+    if (scroll_offset > 0 && entry_count > 0) {
+        current_stack = entries[scroll_offset-1].stack;
+        current_section = entries[scroll_offset-1].section;
+    }
 
     for (int i = scroll_offset; i < entry_count; i++) {
         if (cur_y > window_height) break;
         Entry *e = &entries[i];
-        int is_new_stack = (i == 0) || (e->stack != current_stack);
         
-        int start_of_stack = i;
-        while (start_of_stack > 0 && entries[start_of_stack-1].stack == e->stack) start_of_stack--;
-        int stack_item_index = i - start_of_stack;
-
-        if (is_new_stack) {
-            current_stack = e->stack;
-            if (g_stack_mode != STACKMODE_NONE) cur_y += 28;
+        int draw_header = 0;
+        int use_sections = (strlen(root_path) == 0 && g_stack_mode == STACKMODE_NONE);
+        
+        if (use_sections) {
+            if (i == 0 || e->section != current_section) {
+                draw_header = 1;
+                current_section = e->section;
+            }
+        } else {
+            if (i == 0 || e->stack != current_stack) {
+                draw_header = 1;
+                current_stack = e->stack;
+                if (g_stack_mode == STACKMODE_NONE) draw_header = 0;
+            }
         }
+
+        if (draw_header) cur_y += 28;
+
+        int start_of_group = i;
+        if (use_sections) {
+            while (start_of_group > 0 && entries[start_of_group-1].section == e->section) start_of_group--;
+        } else {
+            while (start_of_group > 0 && entries[start_of_group-1].stack == e->stack) start_of_group--;
+        }
+        int group_item_index = i - start_of_group;
 
         int h = (g_view_mode == VIEWMODE_LIST) ? ROW_HEIGHT : GRID_ITEM_HEIGHT;
         int w = (g_view_mode == VIEWMODE_LIST) ? window_width : GRID_ITEM_WIDTH;
-        int item_x = (g_view_mode == VIEWMODE_LIST) ? 0 : 10 + ((stack_item_index % items_per_row) * GRID_ITEM_WIDTH);
+        int item_x = (g_view_mode == VIEWMODE_LIST) ? 0 : 10 + ((group_item_index % items_per_row) * GRID_ITEM_WIDTH);
         
         // Check hit
         if (y >= cur_y && y < cur_y + h) {
@@ -1021,8 +1126,12 @@ int hit_test_index(int x, int y) {
         if (g_view_mode == VIEWMODE_LIST) {
             cur_y += ROW_HEIGHT;
         } else {
-            int next_is_new = (i + 1 < entry_count) && (entries[i+1].stack != current_stack);
-            if ((stack_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
+            int next_is_new = 0;
+            if (i + 1 < entry_count) {
+                if (use_sections) next_is_new = (entries[i+1].section != current_section);
+                else next_is_new = (entries[i+1].stack != current_stack);
+            }
+            if ((group_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
                 cur_y += GRID_ITEM_HEIGHT;
             }
         }
@@ -1050,9 +1159,11 @@ void show_context_menu(int x, int y) {
 
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, CMD_NEW_FOLDER, "New Folder");
-    AppendMenuA(hMenu, MF_STRING, CMD_RENAME_ENTRY, "Rename (F2)");
-    AppendMenuA(hMenu, MF_STRING, CMD_COPY_ENTRY, "Copy Path");
-    AppendMenuA(hMenu, MF_STRING, CMD_DELETE_ENTRY, "Delete");
+    if (!e || !e->is_drive) {
+        AppendMenuA(hMenu, MF_STRING, CMD_RENAME_ENTRY, "Rename (F2)");
+        AppendMenuA(hMenu, MF_STRING, CMD_COPY_ENTRY, "Copy Path");
+        AppendMenuA(hMenu, MF_STRING, CMD_DELETE_ENTRY, "Delete");
+    }
     AppendMenuA(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuA(hMenu, MF_STRING, CMD_TOGGLE_VIEW, "Toggle Grid/List (F6)");
 
@@ -1118,6 +1229,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case CMD_REMOVE_FAV: if (entry_count) remove_favorite(entries[selected_index].path); refresh_state(); break;
                 case CMD_TOGGLE_VIEW: g_view_mode = !g_view_mode; InvalidateRect(hwnd, NULL, FALSE); break;
                 case CMD_DELETE_ENTRY: {
+                    if (entries[selected_index].is_drive) break;
                     char p[MAX_PATH]; strcpy(p, entries[selected_index].path);
                     p[strlen(p)+1]=0; // double null
                     SHFILEOPSTRUCTA op={0}; op.hwnd=hwnd; op.wFunc=FO_DELETE; op.pFrom=p; op.fFlags=FOF_ALLOWUNDO|FOF_NOCONFIRMATION;
@@ -1145,12 +1257,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     break;
                 case VK_DELETE: SendMessage(hwnd, WM_COMMAND, CMD_DELETE_ENTRY, 0); break;
                 case 'O': if (GetKeyState(VK_CONTROL)&0x8000) handle_ctrl_o(); break;
+                case 'H': if (GetKeyState(VK_CONTROL)&0x8000) { show_help = !show_help; InvalidateRect(hwnd, NULL, FALSE); } break;
             }
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
 
         case WM_CHAR:
-            if (wParam == VK_ESCAPE) { if (strlen(search_buffer)) { search_buffer[0]=0; refresh_state(); } else PostQuitMessage(0); }
+            if (wParam == VK_ESCAPE) { 
+                if (show_help) { show_help = 0; InvalidateRect(hwnd, NULL, FALSE); }
+                else if (strlen(search_buffer)) { search_buffer[0]=0; refresh_state(); } 
+                else PostQuitMessage(0); 
+            }
             else if (wParam == VK_BACK) { int l=strlen(search_buffer); if (l) search_buffer[l-1]=0; else navigate_up(); refresh_state(); }
             else if (wParam >= 32 && wParam < 127) { int l=strlen(search_buffer); search_buffer[l]=wParam; search_buffer[l+1]=0; refresh_state(); }
             return 0;
