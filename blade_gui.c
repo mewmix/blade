@@ -66,6 +66,74 @@
 #define COL_DIM      RGB(100, 100, 100)
 #define COL_HOVER    RGB(30, 30, 30)
 #define COL_HELP_BG  RGB(30, 30, 30)
+// Compile with: cl blade.c user32.lib gdi32.lib shell32.lib ole32.lib /O2 /arch:AVX2
+// Or MinGW: gcc blade.c -o blade.exe -lgdi32 -luser32 -lshell32 -lole32 -mavx2 -O3
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600 // Force Vista+
+#endif
+
+#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <shlobj.h> 
+#include <knownfolders.h>
+#include <process.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <immintrin.h>
+
+#ifndef FIND_FIRST_EX_LARGE_FETCH
+#define FIND_FIRST_EX_LARGE_FETCH 2
+#endif
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+#define MAX_RESULTS 200000
+#define INITIAL_CAPACITY 16384
+#define THREAD_COUNT 16
+#define ARENA_BLOCK_SIZE (32 * 1024 * 1024)
+#define FONT_NAME "Segoe UI"
+#define FONT_SIZE 20
+
+// Layout
+#define ROW_HEIGHT 28
+#define HEADER_HEIGHT 70
+#define GRID_ITEM_WIDTH 120
+#define GRID_ITEM_HEIGHT 100
+
+// Limits
+#define MAX_PINNED 20
+#define MAX_HISTORY 5
+
+// Context menu command IDs
+#define CMD_OPEN            1001
+#define CMD_OPEN_EXPLORER   1002
+#define CMD_NEW_FOLDER      1003
+#define CMD_COPY_ENTRY      1004
+#define CMD_PASTE_ENTRY     1005
+#define CMD_DELETE_ENTRY    1006
+#define CMD_RENAME_ENTRY    1007
+#define CMD_ADD_FAV         1008
+#define CMD_REMOVE_FAV      1009
+#define CMD_TOGGLE_VIEW     1010
+
+// Theme: "Void"
+#define COL_BG       RGB(10, 10, 10)
+#define COL_HEADER   RGB(20, 20, 20)
+#define COL_TEXT     RGB(220, 220, 220)
+#define COL_DIR      RGB(255, 215, 0)
+#define COL_ACCENT   RGB(0, 120, 215)
+#define COL_SEL_TEXT RGB(255, 255, 255)
+#define COL_DIM      RGB(100, 100, 100)
+#define COL_HOVER    RGB(30, 30, 30)
+#define COL_HELP_BG  RGB(30, 30, 30)
 #define COL_RECYCLED RGB(150, 80, 80)
 #define COL_SECTION  RGB(0, 255, 127) // Spring Green for section headers
 
@@ -73,6 +141,16 @@
 // DATA STRUCTURES
 // ==========================================
 typedef enum { SEC_NONE=0, SEC_CORE, SEC_PINNED, SEC_RECENT, SEC_DRIVES } SECTION_TYPE;
+
+typedef enum { 
+    STACK_NONE=0, 
+    STACK_TODAY, STACK_YESTERDAY, STACK_THIS_WEEK, STACK_EARLIER_THIS_MONTH, STACK_LAST_MONTH, STACK_OLDER,
+    STACK_IMAGES, STACK_PDFS, STACK_ARCHIVES, STACK_DOCS, STACK_AUDIO, STACK_VIDEO, STACK_CODE, STACK_EXEC, STACK_OTHER,
+    STACK_WORK, STACK_PERSONAL
+} STACK_TYPE;
+
+typedef enum { STACKMODE_NONE=0, STACKMODE_TIME, STACKMODE_TYPE, STACKMODE_CONTEXT } STACK_MODE;
+
 
 typedef struct {
     char *path;
@@ -82,6 +160,7 @@ typedef struct {
     int is_drive;
     int is_recycled;
     SECTION_TYPE section; // Distinct separation
+    STACK_TYPE stack;     // Dynamic grouping
     unsigned long long total_bytes;
     unsigned long long free_bytes;
     char fs_name[8];
@@ -118,6 +197,7 @@ volatile long active_workers = 0;
 volatile long search_generation = 0;
 SORT_MODE g_sort_mode = SORT_NAME;
 VIEW_MODE g_view_mode = VIEWMODE_LIST;
+STACK_MODE g_stack_mode = STACKMODE_NONE;
 CTRL_O_MODE g_ctrl_o_mode = CTRL_O_WT;
 
 char root_path[4096] = {0};
@@ -203,8 +283,78 @@ void parse_query() {
 }
 
 // ==========================================
-// ARENA ALLOCATOR
+// STACKS LOGIC
 // ==========================================
+const char* get_stack_name(STACK_TYPE type) {
+    switch(type) {
+        case STACK_TODAY: return "Today";
+        case STACK_YESTERDAY: return "Yesterday";
+        case STACK_THIS_WEEK: return "This Week";
+        case STACK_EARLIER_THIS_MONTH: return "Earlier This Month";
+        case STACK_LAST_MONTH: return "Last Month";
+        case STACK_OLDER: return "Older";
+        case STACK_IMAGES: return "Images";
+        case STACK_PDFS: return "PDFs";
+        case STACK_ARCHIVES: return "Archives";
+        case STACK_DOCS: return "Documents";
+        case STACK_AUDIO: return "Audio";
+        case STACK_VIDEO: return "Video";
+        case STACK_CODE: return "Code";
+        case STACK_EXEC: return "Executables";
+        case STACK_WORK: return "Work";
+        case STACK_PERSONAL: return "Personal";
+        case STACK_OTHER: return "Other";
+        default: return "Unsorted";
+    }
+}
+
+STACK_TYPE get_stack_type(const Entry *e, STACK_MODE mode) {
+    if (mode == STACKMODE_NONE) return STACK_NONE;
+    
+    if (mode == STACKMODE_TIME) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        FILETIME ftNow; SystemTimeToFileTime(&st, &ftNow);
+        ULARGE_INTEGER ulNow = {ftNow.dwLowDateTime, ftNow.dwHighDateTime};
+        ULARGE_INTEGER ulFile = {e->write_time.dwLowDateTime, e->write_time.dwHighDateTime};
+        
+        unsigned long long diff = ulNow.QuadPart - ulFile.QuadPart;
+        unsigned long long one_day = 864000000000ULL; // 100ns intervals
+        
+        if (diff < one_day) return STACK_TODAY;
+        if (diff < one_day * 2) return STACK_YESTERDAY;
+        if (diff < one_day * 7) return STACK_THIS_WEEK;
+        if (diff < one_day * 30) return STACK_EARLIER_THIS_MONTH; // Rough approx
+        if (diff < one_day * 60) return STACK_LAST_MONTH;
+        return STACK_OLDER;
+    }
+    
+    if (mode == STACKMODE_TYPE) {
+        if (e->is_dir) return STACK_OTHER;
+        const char *ext = strrchr(e->path, '.');
+        if (!ext) return STACK_OTHER;
+        
+        if (stristr(ext, ".png") || stristr(ext, ".jpg") || stristr(ext, ".jpeg") || stristr(ext, ".gif") || stristr(ext, ".bmp") || stristr(ext, ".webp")) return STACK_IMAGES;
+        if (stristr(ext, ".pdf")) return STACK_PDFS;
+        if (stristr(ext, ".zip") || stristr(ext, ".rar") || stristr(ext, ".7z") || stristr(ext, ".tar") || stristr(ext, ".gz")) return STACK_ARCHIVES;
+        if (stristr(ext, ".doc") || stristr(ext, ".docx") || stristr(ext, ".txt") || stristr(ext, ".rtf") || stristr(ext, ".odt")) return STACK_DOCS;
+        if (stristr(ext, ".mp3") || stristr(ext, ".wav") || stristr(ext, ".flac") || stristr(ext, ".ogg")) return STACK_AUDIO;
+        if (stristr(ext, ".mp4") || stristr(ext, ".mkv") || stristr(ext, ".avi") || stristr(ext, ".mov")) return STACK_VIDEO;
+        if (stristr(ext, ".c") || stristr(ext, ".h") || stristr(ext, ".cpp") || stristr(ext, ".py") || stristr(ext, ".js") || stristr(ext, ".html") || stristr(ext, ".css") || stristr(ext, ".json")) return STACK_CODE;
+        if (stristr(ext, ".exe") || stristr(ext, ".msi") || stristr(ext, ".bat") || stristr(ext, ".cmd") || stristr(ext, ".ps1")) return STACK_EXEC;
+        
+        return STACK_OTHER;
+    }
+
+    if (mode == STACKMODE_CONTEXT) {
+        // Simple heuristic based on path keywords
+        if (stristr(e->path, "Work") || stristr(e->path, "Project") || stristr(e->path, "Office") || stristr(e->path, "Client")) return STACK_WORK;
+        if (stristr(e->path, "Personal") || stristr(e->path, "Game") || stristr(e->path, "Photo") || stristr(e->path, "Music")) return STACK_PERSONAL;
+        return STACK_OTHER;
+    }
+
+    return STACK_NONE;
+}
+
 void arena_init() { arena_head = NULL; }
 char* arena_alloc_str(const char *s) {
     size_t len = strlen(s) + 1;
@@ -355,9 +505,18 @@ void add_entry_ex(const char *full, int dir, unsigned long long sz, const FILETI
     e->section = sec;
     if (ft) e->write_time = *ft; else memset(&e->write_time, 0, sizeof(FILETIME));
     e->is_drive = is_drive;
+    e->stack = get_stack_type(e, g_stack_mode); // Assign stack on creation
     if (is_drive) {
         e->total_bytes = tot; e->free_bytes = free_b;
         strncpy(e->fs_name, fs ? fs : "", 7);
+    }
+    LeaveCriticalSection(&data_lock);
+}
+
+void update_stacks() {
+    EnterCriticalSection(&data_lock);
+    for (int i = 0; i < entry_count; i++) {
+        entries[i].stack = get_stack_type(&entries[i], g_stack_mode);
     }
     LeaveCriticalSection(&data_lock);
 }
@@ -409,6 +568,11 @@ int __cdecl entry_cmp(const void *pa, const void *pb) {
     
     // Sort by section first
     if (a->section != b->section) return a->section - b->section;
+
+    // Sort by Stack if active
+    if (g_stack_mode != STACKMODE_NONE) {
+        if (a->stack != b->stack) return a->stack - b->stack;
+    }
 
     // Folders before files
     if (a->is_dir != b->is_dir) return b->is_dir - a->is_dir;
@@ -700,149 +864,171 @@ void Render(HDC hdcDest) {
     SetTextColor(hdcBack, COL_TEXT);
     char prompt[300];
     if (strlen(search_buffer) > 0) snprintf(prompt, 300, "Query: %s", search_buffer);
-    else strcpy(prompt, "Type to hunt... (Commands: F2 Rename, F6 View, Del)");
+    else strcpy(prompt, "Type to hunt... (F7: Stacks)");
     SelectObject(hdcBack, hFontSmall);
     TextOutA(hdcBack, 10, 35, prompt, strlen(prompt));
 
     char stats[128];
-    snprintf(stats, 128, "%ld items %s %s", entry_count, active_workers > 0 ? "[BUSY]" : "", g_view_mode==VIEWMODE_GRID ? "[GRID]" : "[LIST]");
+    const char* stack_modes[] = {"None", "Time", "Type", "Context"};
+    snprintf(stats, 128, "%ld items [%s] %s", entry_count, stack_modes[g_stack_mode], g_view_mode==VIEWMODE_GRID ? "[GRID]" : "[LIST]");
     SIZE sz; GetTextExtentPoint32A(hdcBack, stats, strlen(stats), &sz);
     TextOutA(hdcBack, window_width - sz.cx - 10, 10, stats, strlen(stats));
 
     EnterCriticalSection(&data_lock);
-    int start_y = HEADER_HEIGHT + 5;
     
     if (g_view_mode == VIEWMODE_LIST) {
         items_per_row = 1;
-        max_visible_items = (window_height - start_y) / ROW_HEIGHT;
     } else {
         items_per_row = window_width / GRID_ITEM_WIDTH;
         if (items_per_row < 1) items_per_row = 1;
-        max_visible_items = ((window_height - start_y) / GRID_ITEM_HEIGHT) * items_per_row;
     }
 
     if (selected_index >= entry_count) selected_index = entry_count - 1;
     if (selected_index < 0) selected_index = 0;
     
-    // Scroll Logic
-    int selected_row = selected_index / items_per_row;
-    int visible_rows = max_visible_items / items_per_row;
-    int scroll_row = scroll_offset / items_per_row;
-
-    if (selected_row < scroll_row) scroll_offset = selected_row * items_per_row;
-    if (selected_row >= scroll_row + visible_rows) scroll_offset = (selected_row - visible_rows + 1) * items_per_row;
+    // Ensure scroll_offset is valid
+    if (scroll_offset >= entry_count) scroll_offset = entry_count - 1;
     if (scroll_offset < 0) scroll_offset = 0;
 
-    int last_section = -1;
+    int y = HEADER_HEIGHT + 5;
+    STACK_TYPE current_stack = STACK_NONE;
+    // Initialize current_stack based on previous item if we are scrolling
+    if (scroll_offset > 0 && entry_count > 0) current_stack = entries[scroll_offset-1].stack;
 
-    for (int i = 0; i < max_visible_items; i++) {
-        int idx = scroll_offset + i;
-        if (idx >= entry_count) break;
-        Entry *e = &entries[idx];
-
-        int col = i % items_per_row;
-        int row = i / items_per_row;
+    for (int i = scroll_offset; i < entry_count; i++) {
+        if (y > window_height) break;
         
-        int x, y, w, h;
+        Entry *e = &entries[i];
+        int is_new_stack = (i == 0) || (e->stack != current_stack);
+        
+        // Find start of stack to calculate grid position
+        int start_of_stack = i;
+        while (start_of_stack > 0 && entries[start_of_stack-1].stack == e->stack) start_of_stack--;
+        int stack_item_index = i - start_of_stack;
 
+        if (is_new_stack) {
+            current_stack = e->stack;
+            // Draw Header
+            if (g_stack_mode != STACKMODE_NONE) {
+                RECT rcH = {0, y, window_width, y + 24};
+                FillRect(hdcBack, &rcH, CreateSolidBrush(COL_HOVER));
+                SetTextColor(hdcBack, COL_SECTION);
+                SelectObject(hdcBack, hFontBold);
+                const char *sn = get_stack_name(e->stack);
+                TextOutA(hdcBack, 10, y + 2, sn, strlen(sn));
+                y += 28;
+            }
+        }
+
+        int x, w, h;
         if (g_view_mode == VIEWMODE_LIST) {
-            x = 10; y = start_y + (row * ROW_HEIGHT);
+            x = 10; 
             w = window_width - 20; h = ROW_HEIGHT;
+            // y is already set
         } else {
+            int col = stack_item_index % items_per_row;
             x = 10 + (col * GRID_ITEM_WIDTH);
-            y = start_y + (row * GRID_ITEM_HEIGHT);
             w = GRID_ITEM_WIDTH - 5; h = GRID_ITEM_HEIGHT - 5;
+            // y is set, but we only increment it when we complete a row
         }
 
         RECT rcItem = {x, y, x + w, y + h};
 
         // Draw selection/hover
-        if (idx == selected_index) {
+        if (i == selected_index) {
             FillRect(hdcBack, &rcItem, CreateSolidBrush(COL_ACCENT));
             SetTextColor(hdcBack, COL_SEL_TEXT);
         } else {
-            if (idx == hover_index) FillRect(hdcBack, &rcItem, CreateSolidBrush(COL_HOVER));
-            
-            // Section Headers (Only effective in List view really, but applied logic)
-            if (strlen(root_path) == 0 && e->section != last_section && e->section != SEC_NONE) {
-               last_section = e->section;
-               // In a real UI we'd draw a header bar here, but for now we color code
-               SetTextColor(hdcBack, COL_SECTION); 
-            } else if (e->is_recycled) {
-                SetTextColor(hdcBack, COL_RECYCLED);
-            } else {
-                SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
-            }
+            if (i == hover_index) FillRect(hdcBack, &rcItem, CreateSolidBrush(COL_HOVER));
+            SetTextColor(hdcBack, e->is_recycled ? COL_RECYCLED : (e->is_dir ? COL_DIR : COL_TEXT));
         }
 
         SelectObject(hdcBack, e->is_recycled ? hFontStrike : hFont);
-
         char disp[MAX_PATH];
-        const char *name = get_display_name(e->path);
-        
-        if (g_view_mode == VIEWMODE_LIST) {
-            // LIST VIEW RENDER
-            if (strlen(root_path) == 0 && e->section != SEC_NONE) {
-                // Add prefix for sections in Home View
-                const char* sec_names[] = {"", "[Core]", "[Favorite]", "[Recent]", "[Drive]"};
-                snprintf(disp, MAX_PATH, "%s %s", sec_names[e->section], name);
-            } else {
-                strcpy(disp, name);
-            }
-            TextOutA(hdcBack, x + 5, y, disp, strlen(disp));
+        strcpy(disp, get_display_name(e->path));
 
-            // Metadata
+        if (g_view_mode == VIEWMODE_LIST) {
+            TextOutA(hdcBack, x + 5, y, disp, strlen(disp));
             SelectObject(hdcBack, hFontSmall);
             char meta[128] = {0};
-            if (e->is_drive) {
-                char f[32], t[32]; format_size(e->free_bytes, f); format_size(e->total_bytes, t);
-                snprintf(meta, 128, "%s/%s", f, t);
-            } else if (!e->is_dir) format_size(e->size, meta);
-            
+            if (!e->is_dir) format_size(e->size, meta);
             if (meta[0]) {
                 SIZE sz; GetTextExtentPoint32A(hdcBack, meta, strlen(meta), &sz);
                 TextOutA(hdcBack, window_width - sz.cx - 20, y, meta, strlen(meta));
             }
+            y += ROW_HEIGHT;
         } else {
-            // GRID VIEW RENDER
-            // Draw a fake "icon" box
+            // Grid View
             RECT rcIcon = {x + (w-40)/2, y + 10, x + (w-40)/2 + 40, y + 50};
             HBRUSH hIcon = CreateSolidBrush(e->is_dir ? COL_DIR : COL_DIM);
             FrameRect(hdcBack, &rcIcon, hIcon);
             DeleteObject(hIcon);
 
-            // Text centered below
             SelectObject(hdcBack, hFontSmall);
             RECT rcText = {x, y + 60, x + w, y + h};
-            DrawTextA(hdcBack, name, -1, &rcText, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+            DrawTextA(hdcBack, disp, -1, &rcText, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+            
+            // Increment Y only if end of row or next is new stack or end of list
+            int next_is_new = (i + 1 < entry_count) && (entries[i+1].stack != current_stack);
+            if ((stack_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
+                y += GRID_ITEM_HEIGHT;
+            }
         }
     }
     LeaveCriticalSection(&data_lock);
     BitBlt(hdcDest, 0, 0, window_width, window_height, hdcBack, 0, 0, SRCCOPY);
 }
 
-// ==========================================
-// INTERACTION
-// ==========================================
 int hit_test_index(int x, int y) {
     if (y < HEADER_HEIGHT + 5) return -1;
-    int rel_y = y - (HEADER_HEIGHT + 5);
-    int row, col, idx;
-    
-    if (g_view_mode == VIEWMODE_LIST) {
-        row = rel_y / ROW_HEIGHT;
-        idx = scroll_offset + row;
-    } else {
-        row = rel_y / GRID_ITEM_HEIGHT;
-        col = (x - 10) / GRID_ITEM_WIDTH;
-        if (col >= items_per_row || col < 0) return -1;
-        idx = scroll_offset + (row * items_per_row) + col;
-    }
     
     EnterCriticalSection(&data_lock);
-    if (idx < 0 || idx >= entry_count) idx = -1;
+    int cur_y = HEADER_HEIGHT + 5;
+    STACK_TYPE current_stack = STACK_NONE;
+    if (scroll_offset > 0 && entry_count > 0) current_stack = entries[scroll_offset-1].stack;
+
+    for (int i = scroll_offset; i < entry_count; i++) {
+        if (cur_y > window_height) break;
+        Entry *e = &entries[i];
+        int is_new_stack = (i == 0) || (e->stack != current_stack);
+        
+        int start_of_stack = i;
+        while (start_of_stack > 0 && entries[start_of_stack-1].stack == e->stack) start_of_stack--;
+        int stack_item_index = i - start_of_stack;
+
+        if (is_new_stack) {
+            current_stack = e->stack;
+            if (g_stack_mode != STACKMODE_NONE) cur_y += 28;
+        }
+
+        int h = (g_view_mode == VIEWMODE_LIST) ? ROW_HEIGHT : GRID_ITEM_HEIGHT;
+        int w = (g_view_mode == VIEWMODE_LIST) ? window_width : GRID_ITEM_WIDTH;
+        int item_x = (g_view_mode == VIEWMODE_LIST) ? 0 : 10 + ((stack_item_index % items_per_row) * GRID_ITEM_WIDTH);
+        
+        // Check hit
+        if (y >= cur_y && y < cur_y + h) {
+            if (g_view_mode == VIEWMODE_LIST) {
+                LeaveCriticalSection(&data_lock);
+                return i;
+            } else {
+                if (x >= item_x && x < item_x + w) {
+                    LeaveCriticalSection(&data_lock);
+                    return i;
+                }
+            }
+        }
+
+        if (g_view_mode == VIEWMODE_LIST) {
+            cur_y += ROW_HEIGHT;
+        } else {
+            int next_is_new = (i + 1 < entry_count) && (entries[i+1].stack != current_stack);
+            if ((stack_item_index % items_per_row) == items_per_row - 1 || next_is_new || i == entry_count - 1) {
+                cur_y += GRID_ITEM_HEIGHT;
+            }
+        }
+    }
     LeaveCriticalSection(&data_lock);
-    return idx;
+    return -1;
 }
 
 void show_context_menu(int x, int y) {
@@ -952,6 +1138,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case VK_F4: g_sort_mode=SORT_SIZE; sort_entries(); break;
                 case VK_F5: g_sort_mode=SORT_DATE; sort_entries(); break;
                 case VK_F6: g_view_mode=!g_view_mode; break;
+                case VK_F7: 
+                    g_stack_mode = (g_stack_mode + 1) % 4; 
+                    update_stacks(); 
+                    sort_entries(); 
+                    break;
                 case VK_DELETE: SendMessage(hwnd, WM_COMMAND, CMD_DELETE_ENTRY, 0); break;
                 case 'O': if (GetKeyState(VK_CONTROL)&0x8000) handle_ctrl_o(); break;
             }
