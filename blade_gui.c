@@ -1,6 +1,8 @@
-// Force Windows Vista+ API
+// Compile with: cl blade.c user32.lib gdi32.lib shell32.lib ole32.lib /O2 /arch:AVX2
+// Or MinGW: gcc blade.c -o blade.exe -lgdi32 -luser32 -lshell32 -lole32 -mavx2 -O3
+
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
+#define _WIN32_WINNT 0x0600 // Force Vista+ for SHGetKnownFolderPath
 #endif
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -9,12 +11,20 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h> // For SHGetKnownFolderPath
+#include <knownfolders.h> // For FOLDERID_* constants (Vista+)
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <immintrin.h> // AVX2
+
+// Some SDKs gate this behind _WIN32_WINNT >= 0x0601 (Win7)
+// Provide the constant if missing so FindFirstFileExA can use large fetch.
+#ifndef FIND_FIRST_EX_LARGE_FETCH
+#define FIND_FIRST_EX_LARGE_FETCH 2
+#endif
 
 // ==========================================
 // CONFIGURATION
@@ -27,6 +37,7 @@
 #define FONT_SIZE 20
 #define ROW_HEIGHT 28
 #define HEADER_HEIGHT 70
+#define MAX_FAVORITES 20
 
 // Context menu command IDs
 #define CMD_OPEN            1001
@@ -36,6 +47,7 @@
 #define CMD_PASTE_ENTRY     1005
 #define CMD_DELETE_ENTRY    1006
 #define CMD_RENAME_ENTRY    1007
+#define CMD_REMOVE_FAV      1008
 
 // Theme: "Void"
 #define COL_BG       RGB(10, 10, 10)
@@ -47,6 +59,7 @@
 #define COL_DIM      RGB(100, 100, 100)
 #define COL_HOVER    RGB(30, 30, 30)
 #define COL_HELP_BG  RGB(30, 30, 30)
+#define COL_RECYCLED RGB(150, 80, 80) // Reddish dim for deleted items
 
 // ==========================================
 // DATA STRUCTURES
@@ -57,6 +70,8 @@ typedef struct {
     unsigned long long size;
     FILETIME write_time;
     int is_drive;
+    int is_recycled;   // <--- NEW: Flag for recycle bin
+    int is_favorite;   // <--- NEW: Flag for favorites
     unsigned long long total_bytes;
     unsigned long long free_bytes;
     char fs_name[8];
@@ -79,12 +94,16 @@ CRITICAL_SECTION data_lock;
 
 ArenaBlock *arena_head = NULL; 
 
+// Favorites Storage
+char favorites[MAX_FAVORITES][MAX_PATH];
+int fav_count = 0;
+
 // App State
 volatile int running = 1;
 volatile long active_workers = 0;
 volatile long search_generation = 0;
 SORT_MODE g_sort_mode = SORT_NAME;
-CTRL_O_MODE g_ctrl_o_mode = CTRL_O_WT; // Default to Windows Terminal
+CTRL_O_MODE g_ctrl_o_mode = CTRL_O_WT;
 
 char root_path[4096] = {0};
 char search_buffer[256] = {0};
@@ -122,54 +141,7 @@ HBITMAP hbmOld = NULL;
 HFONT hFont = NULL;
 HFONT hFontSmall = NULL;
 HFONT hFontMono = NULL;
-
-// ==========================================
-// SETTINGS LOADING
-// ==========================================
-void load_settings() {
-    GetModuleFileNameA(NULL, g_ini_path, MAX_PATH);
-    char *last_slash = strrchr(g_ini_path, '\\');
-    if (last_slash) *(last_slash + 1) = 0;
-    strcat(g_ini_path, "blade.ini");
-
-    char buf[32] = {0};
-    GetPrivateProfileStringA("General", "CtrlO", "wt", buf, 32, g_ini_path);
-    
-    if (_stricmp(buf, "cmd") == 0) g_ctrl_o_mode = CTRL_O_CMD;
-    else if (_stricmp(buf, "explorer") == 0) g_ctrl_o_mode = CTRL_O_EXPLORER;
-    else g_ctrl_o_mode = CTRL_O_WT;
-}
-
-// ==========================================
-// ARENA ALLOCATOR
-// ==========================================
-void arena_init() { arena_head = NULL; }
-
-char* arena_alloc_str(const char *s) {
-    size_t len = strlen(s) + 1;
-    if (arena_head == NULL || (arena_head->used + len > ARENA_BLOCK_SIZE)) {
-        ArenaBlock *b = (ArenaBlock*)malloc(sizeof(ArenaBlock));
-        b->data = (char*)malloc(ARENA_BLOCK_SIZE);
-        b->used = 0;
-        b->next = arena_head;
-        arena_head = b;
-    }
-    char *ret = arena_head->data + arena_head->used;
-    memcpy(ret, s, len);
-    arena_head->used += len;
-    return ret;
-}
-
-void arena_free_all() {
-    ArenaBlock *curr = arena_head;
-    while (curr) {
-        ArenaBlock *next = curr->next;
-        free(curr->data);
-        free(curr);
-        curr = next;
-    }
-    arena_head = NULL;
-}
+HFONT hFontStrike = NULL; // <--- NEW: Strikethrough font
 
 // ==========================================
 // UTILS & PARSING
@@ -220,6 +192,122 @@ void parse_query() {
 }
 
 // ==========================================
+// ARENA ALLOCATOR
+// ==========================================
+void arena_init() { arena_head = NULL; }
+
+char* arena_alloc_str(const char *s) {
+    size_t len = strlen(s) + 1;
+    if (arena_head == NULL || (arena_head->used + len > ARENA_BLOCK_SIZE)) {
+        ArenaBlock *b = (ArenaBlock*)malloc(sizeof(ArenaBlock));
+        b->data = (char*)malloc(ARENA_BLOCK_SIZE);
+        b->used = 0;
+        b->next = arena_head;
+        arena_head = b;
+    }
+    char *ret = arena_head->data + arena_head->used;
+    memcpy(ret, s, len);
+    arena_head->used += len;
+    return ret;
+}
+
+void arena_free_all() {
+    ArenaBlock *curr = arena_head;
+    while (curr) {
+        ArenaBlock *next = curr->next;
+        free(curr->data);
+        free(curr);
+        curr = next;
+    }
+    arena_head = NULL;
+}
+
+// ==========================================
+// FAVORITES / RECENT (VISTA+ API)
+// ==========================================
+void get_favorites_path(char *out_path) {
+    PWSTR localAppData = NULL;
+    // Force Vista+ API: SHGetKnownFolderPath
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &localAppData))) {
+        wcstombs(out_path, localAppData, MAX_PATH);
+        CoTaskMemFree(localAppData);
+        strcat(out_path, "\\BladeExplorer");
+        CreateDirectoryA(out_path, NULL); // Ensure dir exists
+        strcat(out_path, "\\recent.dat");
+    } else {
+        // Fallback
+        strcpy(out_path, "recent.dat");
+    }
+}
+
+void save_favorites() {
+    char path[MAX_PATH];
+    get_favorites_path(path);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(&fav_count, sizeof(int), 1, f);
+        for (int i=0; i<fav_count; i++) {
+            fwrite(favorites[i], 1, MAX_PATH, f);
+        }
+        fclose(f);
+    }
+}
+
+void load_favorites() {
+    char path[MAX_PATH];
+    get_favorites_path(path);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        if (fread(&fav_count, sizeof(int), 1, f) == 1) {
+            if (fav_count > MAX_FAVORITES) fav_count = MAX_FAVORITES;
+            for (int i=0; i<fav_count; i++) {
+                fread(favorites[i], 1, MAX_PATH, f);
+            }
+        }
+        fclose(f);
+    }
+}
+
+void add_favorite(const char *path) {
+    // Check duplicates
+    for (int i = 0; i < fav_count; i++) {
+        if (_stricmp(favorites[i], path) == 0) {
+            // Move to top
+            char temp[MAX_PATH];
+            strcpy(temp, favorites[i]);
+            for (int k = i; k > 0; k--) strcpy(favorites[k], favorites[k-1]);
+            strcpy(favorites[0], temp);
+            save_favorites();
+            return;
+        }
+    }
+    // Shift down
+    if (fav_count < MAX_FAVORITES) fav_count++;
+    for (int i = fav_count - 1; i > 0; i--) {
+        strcpy(favorites[i], favorites[i-1]);
+    }
+    strncpy(favorites[0], path, MAX_PATH);
+    save_favorites();
+}
+
+// ==========================================
+// SETTINGS LOADING
+// ==========================================
+void load_settings() {
+    GetModuleFileNameA(NULL, g_ini_path, MAX_PATH);
+    char *last_slash = strrchr(g_ini_path, '\\');
+    if (last_slash) *(last_slash + 1) = 0;
+    strcat(g_ini_path, "blade.ini");
+
+    char buf[32] = {0};
+    GetPrivateProfileStringA("General", "CtrlO", "wt", buf, 32, g_ini_path);
+    
+    if (_stricmp(buf, "cmd") == 0) g_ctrl_o_mode = CTRL_O_CMD;
+    else if (_stricmp(buf, "explorer") == 0) g_ctrl_o_mode = CTRL_O_EXPLORER;
+    else g_ctrl_o_mode = CTRL_O_WT;
+}
+
+// ==========================================
 // DATA MANAGEMENT
 // ==========================================
 void clear_data() {
@@ -248,6 +336,14 @@ void add_entry_ex(const char *full, int dir, unsigned long long sz, const FILETI
     e->path = arena_alloc_str(full);
     e->is_dir = dir;
     e->size = sz;
+    e->is_recycled = 0;
+    e->is_favorite = 0;
+
+    // Detect Recycle Bin
+    if (stristr(full, "$Recycle.Bin") || stristr(full, "\\RECYCLER\\")) {
+        e->is_recycled = 1;
+    }
+
     if (ft) e->write_time = *ft;
     else memset(&e->write_time, 0, sizeof(FILETIME));
 
@@ -313,10 +409,13 @@ int __cdecl entry_cmp(const void *pa, const void *pb) {
     const Entry *a = (const Entry*)pa;
     const Entry *b = (const Entry*)pb;
 
+    // 1. Favorites/Drives at top usually, but inside folder view:
+    // ALWAYS sort directories before files
     int dirA = a->is_dir != 0;
     int dirB = b->is_dir != 0;
-    if (dirA != dirB) return dirB - dirA; 
+    if (dirA != dirB) return dirB - dirA; // 1 = dir, 0 = file. Returns positive if a is dir and b is file.
 
+    // 2. Apply requested sort mode
     switch (g_sort_mode) {
         case SORT_SIZE:
             if (a->size != b->size) return (b->size > a->size) ? 1 : -1;
@@ -327,6 +426,7 @@ int __cdecl entry_cmp(const void *pa, const void *pb) {
             break;
         }
     }
+    // 3. Fallback to Name
     return _stricmp(get_display_name(a->path), get_display_name(b->path));
 }
 
@@ -357,8 +457,28 @@ void list_directory(const char *path) {
     sort_entries();
 }
 
-void list_drives() {
+void list_drives_and_favs() {
     clear_data();
+    
+    // 1. Add Favorites first
+    for(int i = 0; i < fav_count; i++) {
+        EnterCriticalSection(&data_lock);
+        if (entry_count < MAX_RESULTS) {
+            Entry *e = &entries[entry_count];
+            // Simple fake attributes for favorites
+            e->path = arena_alloc_str(favorites[i]);
+            DWORD attr = GetFileAttributesA(favorites[i]);
+            e->is_dir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+            e->is_drive = 0;
+            e->is_favorite = 1;
+            e->size = 0;
+            memset(&e->write_time, 0, sizeof(FILETIME));
+            entry_count++;
+        }
+        LeaveCriticalSection(&data_lock);
+    }
+
+    // 2. Add Drives
     DWORD drives = GetLogicalDrives();
     char root[] = "A:\\";
     for (int i = 0; i < 26; i++) {
@@ -371,6 +491,7 @@ void list_drives() {
             add_entry_ex(root, 1, 0, NULL, 1, totalBytes.QuadPart, totalFree.QuadPart, fs);
         }
     }
+    // No sort here, we want Favorites at top, then drives A-Z
     InvalidateRect(hMainWnd, NULL, FALSE);
 }
 
@@ -434,17 +555,13 @@ void refresh_state() {
     InterlockedIncrement(&search_generation);
     parse_query();
 
-    // 1. Construct a potential full path from the search buffer
     char target_path[4096] = {0};
     int is_absolute = (search_buffer[1] == ':' || (search_buffer[0] == '\\' && search_buffer[1] == '\\'));
 
     if (is_absolute) {
-        // User typed absolute path (e.g. "C:\Windows")
         lstrcpynA(target_path, search_buffer, 4096);
     } 
     else if (strlen(root_path) > 0) {
-        // User typed relative path (e.g. "Users") -> "C:\Users"
-        // Handle trailing slash on root_path to avoid double slashes (C:\\Users)
         size_t root_len = strlen(root_path);
         if (root_path[root_len - 1] == '\\')
             snprintf(target_path, 4096, "%s%s", root_path, search_buffer);
@@ -452,22 +569,16 @@ void refresh_state() {
             snprintf(target_path, 4096, "%s\\%s", root_path, search_buffer);
     }
 
-    // 2. Check if this path actually exists and is a Directory
     DWORD attr = (target_path[0]) ? GetFileAttributesA(target_path) : INVALID_FILE_ATTRIBUTES;
     int is_valid_dir = (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
 
-    // 3. Decide: Browse (List) vs Hunt (Search)
-    
-    // MODE A: Buffer is empty -> Standard Directory Browsing
     if (strlen(search_buffer) == 0) {
-        if (strlen(root_path) == 0) list_drives();
+        if (strlen(root_path) == 0) list_drives_and_favs();
         else list_directory(root_path);
     }
-    // MODE B: Input matches a Directory -> Show that directory's contents (Live Preview)
     else if (is_valid_dir) {
         list_directory(target_path);
     }
-    // MODE C: Input is just text -> Recursive File Search (Hunter)
     else {
         clear_data();
         is_wildcard = (strchr(query.name, '*') || strchr(query.name, '?'));
@@ -477,6 +588,7 @@ void refresh_state() {
 
     InvalidateRect(hMainWnd, NULL, FALSE);
 }
+
 // ==========================================
 // NAVIGATION HELPERS
 // ==========================================
@@ -492,6 +604,7 @@ void navigate_up() {
 }
 
 void open_path(const char *p) {
+    add_favorite(p); // Add to recent/favorites
     ShellExecuteA(NULL, "open", p, NULL, NULL, SW_SHOWDEFAULT);
 }
 
@@ -516,11 +629,13 @@ void navigate_down() {
         if (e->is_dir) {
             strcpy(root_path, e->path);
             search_buffer[0] = 0;
+            if(!e->is_drive) add_favorite(e->path); // Add folders to recent too
             LeaveCriticalSection(&data_lock);
             refresh_state();
         } else {
-            open_path(e->path);
+            char p[4096]; strcpy(p, e->path);
             LeaveCriticalSection(&data_lock);
+            open_path(p);
         }
     } else {
         LeaveCriticalSection(&data_lock);
@@ -586,80 +701,48 @@ LRESULT CALLBACK InputBoxWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 DestroyWindow(hwnd);
             }
             return 0;
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
+        case WM_CLOSE: DestroyWindow(hwnd); return 0;
+        case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 int InputBox(HWND owner, const char *title, const char *prompt, char *buffer) {
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc = InputBoxWndProc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "BladeInputBox";
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
-    RegisterClassA(&wc);
+    WNDCLASSA wc = {0}; wc.lpfnWndProc = InputBoxWndProc; wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "BladeInputBox"; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1); RegisterClassA(&wc);
 
-    strncpy(ib_result, buffer, MAX_PATH);
-    strncpy(ib_prompt, prompt, 64);
-    ib_success = 0;
-
+    strncpy(ib_result, buffer, MAX_PATH); strncpy(ib_prompt, prompt, 64); ib_success = 0;
     RECT rcOwner; GetWindowRect(owner, &rcOwner);
     int x = rcOwner.left + (rcOwner.right - rcOwner.left)/2 - 150;
     int y = rcOwner.top + (rcOwner.bottom - rcOwner.top)/2 - 75;
 
-    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "BladeInputBox", title, 
-                               WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
-                               x, y, 320, 150, owner, NULL, GetModuleHandle(NULL), NULL);
-    
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, "BladeInputBox", title, WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, 320, 150, owner, NULL, GetModuleHandle(NULL), NULL);
     EnableWindow(owner, FALSE);
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    EnableWindow(owner, TRUE);
-    SetForegroundWindow(owner);
-    
+    MSG msg; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    EnableWindow(owner, TRUE); SetForegroundWindow(owner);
     if (ib_success) strcpy(buffer, ib_result);
     return ib_success;
 }
 
 void rename_entry() {
-    char old_path[4096] = {0};
-    char old_name[MAX_PATH] = {0};
-    
+    char old_path[4096] = {0}; char old_name[MAX_PATH] = {0};
     EnterCriticalSection(&data_lock);
     if (entry_count > 0 && selected_index >= 0 && selected_index < entry_count) {
         lstrcpynA(old_path, entries[selected_index].path, 4096);
-        const char *disp = get_display_name(old_path);
-        lstrcpynA(old_name, disp, MAX_PATH);
+        lstrcpynA(old_name, get_display_name(old_path), MAX_PATH);
     }
     LeaveCriticalSection(&data_lock);
 
     if (old_path[0] == 0) return;
-
-    char new_name[MAX_PATH];
-    strcpy(new_name, old_name);
+    char new_name[MAX_PATH]; strcpy(new_name, old_name);
 
     if (InputBox(hMainWnd, "Rename", "Enter new name:", new_name)) {
         if (strcmp(old_name, new_name) == 0) return;
-
-        char new_path[4096];
-        strcpy(new_path, old_path);
-        char *slash = strrchr(new_path, '\\');
-        if (slash) *(slash+1) = 0;
+        char new_path[4096]; strcpy(new_path, old_path);
+        char *slash = strrchr(new_path, '\\'); if (slash) *(slash+1) = 0;
         strcat(new_path, new_name);
-
-        if (MoveFileA(old_path, new_path)) {
-            refresh_state();
-        } else {
-            MessageBoxA(hMainWnd, "Failed to rename file.", "Error", MB_ICONERROR);
-        }
+        if (MoveFileA(old_path, new_path)) refresh_state();
+        else MessageBoxA(hMainWnd, "Failed to rename file.", "Error", MB_ICONERROR);
     }
 }
 
@@ -759,7 +842,6 @@ void Render(HDC hdcDest) {
     SelectObject(hdcBack, hFontSmall);
     TextOutA(hdcBack, 10, 35, prompt, strlen(prompt));
 
-    // Draw Clickable Header Labels (Moved further right to avoid overlap)
     int header_y = HEADER_HEIGHT - 20;
     SetTextColor(hdcBack, COL_DIM);
     TextOutA(hdcBack, window_width - 350, header_y, "Name (F3)", 9);
@@ -781,7 +863,7 @@ void Render(HDC hdcDest) {
     if (selected_index < scroll_offset) scroll_offset = selected_index;
     if (selected_index >= scroll_offset + max_visible_items) scroll_offset = selected_index - max_visible_items + 1;
 
-    SelectObject(hdcBack, hFont);
+    
     for (int i = 0; i < max_visible_items; i++) {
         int idx = scroll_offset + i;
         if (idx >= entry_count) break;
@@ -801,11 +883,21 @@ void Render(HDC hdcDest) {
                 FillRect(hdcBack, &rcRow, hHover);
                 DeleteObject(hHover);
             }
-            SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
+            if (e->is_recycled) SetTextColor(hdcBack, COL_RECYCLED);
+            else SetTextColor(hdcBack, e->is_dir ? COL_DIR : COL_TEXT);
         }
 
-        const char *disp = get_display_name(e->path);
+        // Strikethrough for Recycled items
+        if (e->is_recycled) SelectObject(hdcBack, hFontStrike);
+        else SelectObject(hdcBack, hFont);
+
+        char disp[4096];
+        if (e->is_favorite) snprintf(disp, 4096, "* %s", get_display_name(e->path));
+        else strcpy(disp, get_display_name(e->path));
         TextOutA(hdcBack, 15, y, disp, strlen(disp));
+
+        // Restore normal font for metadata
+        SelectObject(hdcBack, hFont);
 
         char meta[128] = {0};
         if (e->is_drive) {
@@ -814,6 +906,8 @@ void Render(HDC hdcDest) {
             snprintf(meta, 128, "%s free / %s (%s)", szFree, szTot, e->fs_name);
         } else if (!e->is_dir) {
             format_size(e->size, meta);
+        } else if (e->is_favorite) {
+            strcpy(meta, "Recent/Favorite");
         }
         
         if (meta[0]) {
@@ -839,10 +933,10 @@ void Render(HDC hdcDest) {
             " Navigation: Arrows, PageUp/Dn, Enter, Backspace",
             " Search:     Type to hunt recursively",
             " Filters:    ext:.log  >100mb  <5kb",
+            " Favorites:  Saved automatically on open",
             " Ops:        Ctrl+C/V (Copy/Paste)",
             "             F2 (Rename), Del (Recycle Bin)",
             "             Ctrl+Shift+N (New Folder)",
-            "             Ctrl+Shift+C (Copy Path)",
             " Sort:       F3 (Name), F4 (Size), F5 (Date)",
             " Power:      Ctrl+L (Copy Current Path)",
             "             Ctrl+O (Open Here - configurable)",
@@ -872,7 +966,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hFont = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             hFontSmall = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
             hFontMono = CreateFontA(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Consolas");
+            // Strikethrough Font
+            hFontStrike = CreateFontA(22, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, TRUE /* Strike */, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, FONT_NAME);
+            
+            CoInitialize(NULL); // Required for SHGetKnownFolderPath
             load_settings();
+            load_favorites();
             refresh_state();
             SetTimer(hwnd, 1, 100, NULL);
             return 0;
@@ -958,44 +1057,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case VK_F4: g_sort_mode = SORT_SIZE; sort_entries(); break;
                 case VK_F5: g_sort_mode = SORT_DATE; sort_entries(); break;
                 case VK_RETURN: {
-                // Handle Ctrl+Enter (Open in Explorer)
                 if (GetKeyState(VK_CONTROL) & 0x8000) { 
                     EnterCriticalSection(&data_lock); 
                     if (entry_count > 0) open_in_explorer(entries[selected_index].path); 
                     LeaveCriticalSection(&data_lock); 
                 }
                 else { 
-                    // 1. Construct a potential full path from the search buffer
                     char target_path[4096] = {0};
                     int is_absolute = (search_buffer[1] == ':' || (search_buffer[0] == '\\' && search_buffer[1] == '\\'));
-
-                    if (is_absolute) {
-                        // User typed "C:\Windows"
-                        lstrcpynA(target_path, search_buffer, 4096);
-                    } 
-                    else if (strlen(root_path) > 0 && strlen(search_buffer) > 0) {
-                        // User typed "Windows" while in "C:\" -> Resolve to "C:\Windows"
-                        snprintf(target_path, 4096, "%s\\%s", root_path, search_buffer);
-                    }
-
-                    // 2. Check if that manual path exists
+                    if (is_absolute) lstrcpynA(target_path, search_buffer, 4096);
+                    else if (strlen(root_path) > 0 && strlen(search_buffer) > 0) snprintf(target_path, 4096, "%s\\%s", root_path, search_buffer);
                     DWORD attr = (target_path[0]) ? GetFileAttributesA(target_path) : INVALID_FILE_ATTRIBUTES;
 
                     if (attr != INVALID_FILE_ATTRIBUTES) {
-                        if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-                            // It's a folder: Navigate into it immediately
-                            strcpy(root_path, target_path);
-                            search_buffer[0] = 0;
-                            refresh_state();
-                        } else {
-                            // It's a file: Open it
-                            open_path(target_path);
-                        }
+                        if (attr & FILE_ATTRIBUTE_DIRECTORY) { strcpy(root_path, target_path); search_buffer[0] = 0; refresh_state(); } 
+                        else open_path(target_path);
                     } 
-                    else {
-                        // 3. Path invalid? Fallback to opening the currently selected search result
-                        navigate_down(); 
-                    }
+                    else navigate_down(); 
                 }
                 return 0;
             }
@@ -1013,7 +1091,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
-        case WM_DESTROY: running=0; KillTimer(hwnd,1); clear_data(); free(entries); DeleteCriticalSection(&data_lock); PostQuitMessage(0); return 0;
+        case WM_DESTROY: 
+            running=0; KillTimer(hwnd,1); clear_data(); free(entries); 
+            DeleteCriticalSection(&data_lock); 
+            CoUninitialize(); 
+            PostQuitMessage(0); 
+            return 0;
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }

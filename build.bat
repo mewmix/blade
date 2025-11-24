@@ -14,6 +14,6 @@ echo #define COMMIT_SHA "%COMMIT_SHA%" >> version.h
 rem Compile blade_tui.c
 gcc -O3 -mavx2 blade_tui.c -o blade.exe
 echo TUI Build complete.
-gcc -O3 -mavx2 -mwindows blade_gui.c -o BladeExplorer.exe -lgdi32 -luser32 -lshell32 -lole32 -lcomctl32
+gcc -O3 -mavx2 -mwindows blade_gui.c -o BladeExplorer.exe -lgdi32 -luser32 -lshell32 -lole32 -lcomctl32 -luuid
 echo GUI Build complete.
 endlocal
