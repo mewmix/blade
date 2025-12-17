@@ -25,6 +25,10 @@ Blade ships in two flavors to suit your workflow:
 *   **Native GDI GUI:** Double-buffered, responsive interface with standard Windows controls.
 *   **Power Search:** Support for wildcards (`*`, `?`) and advanced filters (`ext:`, `>`, `<`).
 *   **Shell Integration:** Context menus, Recycle Bin deletion, and copy/paste compatibility with Windows Explorer.
+*   **Home View Sections:** Core folders, Favorites (Pinned), Recent (History), and Drives grouped with section headers.
+*   **Favorites:** Pin/unpin folders via context menu; separate automatic Recent history (max 5) from user-managed Pinned.
+*   **Known Folders:** Automatically surfaces Desktop, Documents, Downloads, Pictures, Music, and Videos using `SHGetKnownFolderPath`.
+*   **Grid/List Toggle:** Press `F6` or use the context menu to switch between compact list and grid layouts.
 
 ## Usage
 
@@ -75,7 +79,16 @@ CtrlO=wt
 | `Ctrl + O` | Open Terminal/Shell here (Configurable) |
 | `Ctrl + Enter` | Open selected item in Windows Explorer |
 | `Ctrl + H` | Toggle Help Overlay |
+| `F6` | Toggle Grid/List view |
 | `ESC` | Clear search / Quit |
+
+### Favorites and Home View
+
+- Home shows four sections: Core, Favorites (Pinned), Recent (History), and Drives.
+- Favorites are user-managed pinned folders; use right-click to Add/Remove from Favorites.
+- Recent automatically tracks the last 5 visited folders (excludes drive roots).
+- Core folders (Desktop, Documents, Downloads, Pictures, Music, Videos) are discovered via `SHGetKnownFolderPath`.
+- Data for pinned and recent lists is stored under LocalAppData in `BladeExplorer\\blade_data.dat`.
 
 ---
 

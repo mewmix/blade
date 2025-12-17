@@ -1,2 +1,2 @@
-#define VERSION "1.0.6" 
-$18966cb81cad29754b31c5d4a30ebf4b0ec9452a5" 
+#define VERSION "1.0.7" 
+$1443220dbe47445a298eb4696bcc270e08afec24d" 

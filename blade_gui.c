@@ -1280,6 +1280,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE h, HINSTANCE p, LPSTR c, int s) {
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     entries = (Entry*)malloc(INITIAL_CAPACITY * sizeof(Entry));
     entry_capacity = INITIAL_CAPACITY;
     InitializeCriticalSection(&data_lock);
